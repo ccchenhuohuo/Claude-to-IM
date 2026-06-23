@@ -346,7 +346,10 @@ async function consumeStream(
             try {
               const resultData = JSON.parse(event.data);
               if (resultData.usage) tokenUsage = resultData.usage;
-              if (resultData.is_error) hasError = true;
+              if (resultData.is_error) {
+                hasError = true;
+                if (resultData.error) errorMessage = String(resultData.error);
+              }
               if (resultData.session_id) {
                 capturedSdkSessionId = resultData.session_id;
                 store.updateSdkSessionId(sessionId, resultData.session_id);
