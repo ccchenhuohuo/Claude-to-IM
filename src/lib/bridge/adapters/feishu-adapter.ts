@@ -78,7 +78,9 @@ type FeishuMessageEventData = {
   message: {
     message_id: string;
     chat_id: string;
-    chat_type: string;
+    chat_type?: string;
+    chat_mode?: string;
+    group_message_type?: string;
     message_type: string;
     content: string;
     create_time: string;
@@ -114,6 +116,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private botOpenId: string | null = null;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
   private botIds = new Set<string>();
+  /** Cache chat mode lookups when event payload omits reliable group markers. */
+  private chatModeCache = new Map<string, boolean>();
   /** Track last incoming message ID per chat for typing indicator. */
   private lastIncomingMessageId = new Map<string, string>();
   /** Track active typing reaction IDs per chat for cleanup. */
@@ -927,6 +931,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
+  private async resolveIsGroupChat(msg: FeishuMessageEventData['message']): Promise<boolean> {
+    if (msg.chat_mode === 'group' || msg.chat_mode === 'topic') return true;
+    if (msg.chat_type === 'group') return true;
+    if (msg.group_message_type) return true;
+    if (msg.chat_mode === 'p2p') return false;
+
+    const cached = this.chatModeCache.get(msg.chat_id);
+    if (cached !== undefined) return cached;
+
+    if (!this.restClient) return false;
+    try {
+      const res = await this.restClient.im.chat.get({
+        path: { chat_id: msg.chat_id },
+      });
+      const chat = res?.data as { chat_mode?: string; group_message_type?: string } | undefined;
+      const isGroup = chat?.chat_mode === 'group' || chat?.chat_mode === 'topic' || Boolean(chat?.group_message_type);
+      this.chatModeCache.set(msg.chat_id, isGroup);
+      return isGroup;
+    } catch (err) {
+      console.warn('[feishu-adapter] Failed to resolve chat mode:', err instanceof Error ? err.message : err);
+      return false;
+    }
+  }
+
   private async processIncomingEvent(data: FeishuMessageEventData): Promise<void> {
     const msg = data.message;
     const sender = data.sender;
@@ -944,7 +972,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       || sender.sender_id?.user_id
       || sender.sender_id?.union_id
       || '';
-    const isGroup = msg.chat_type === 'group';
+    const isGroup = await this.resolveIsGroupChat(msg);
 
     // Authorization check
     if (!this.isAuthorized(userId, chatId)) {
