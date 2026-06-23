@@ -11,7 +11,9 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import type { BridgeStore, LifecycleHooks } from '../../lib/bridge/host';
+import type { BridgeStore, LifecycleHooks, LLMProvider } from '../../lib/bridge/host';
+import type { InboundMessage, OutboundMessage, SendResult } from '../../lib/bridge/types';
+import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
 
 // ── Test the session lock mechanism directly ────────────────
 // We test the processWithSessionLock pattern by extracting its logic.
@@ -166,4 +168,121 @@ function createMinimalStore(settings: Record<string, string> = {}): BridgeStore 
     getChannelOffset: () => '0',
     setChannelOffset: () => {},
   };
+}
+
+
+// ── Feishu mention-only ambient context ───────────────────────
+
+describe('bridge-manager feishu ambient group context', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('records context-only group messages without invoking the LLM or replying', async () => {
+    const store = createMinimalStore({ bridge_feishu_group_context_max_messages: '20' });
+    let llmCalls = 0;
+    const llm: LLMProvider = {
+      streamChat: () => {
+        llmCalls += 1;
+        return new ReadableStream();
+      },
+    };
+    initBridgeContext({
+      store,
+      llm,
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sent: OutboundMessage[] = [];
+    const adapter = createMinimalAdapter('feishu', sent);
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'ctx-1',
+      address: { channelType: 'feishu', chatId: 'group-1', userId: 'user-a' },
+      text: '预算按照 Q3 口径算',
+      timestamp: Date.now(),
+      contextOnly: true,
+      isGroup: true,
+      triggerReason: 'context_only',
+      senderName: 'Alice',
+    });
+
+    assert.equal(llmCalls, 0);
+    assert.equal(sent.length, 0);
+  });
+
+  it('injects recent context-only messages into the next mention prompt', async () => {
+    const store = createMinimalStore({
+      bridge_feishu_group_context_max_messages: '20',
+      bridge_feishu_group_context_max_age_minutes: '60',
+      bridge_feishu_group_context_max_chars: '8000',
+    });
+    const prompts: string[] = [];
+    const llm: LLMProvider = {
+      streamChat: (params) => {
+        prompts.push(params.prompt);
+        return new ReadableStream({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'OK' })}\n`);
+            controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: JSON.stringify({ is_error: false }) })}\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    initBridgeContext({
+      store,
+      llm,
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sent: OutboundMessage[] = [];
+    const adapter = createMinimalAdapter('feishu', sent);
+    const baseTime = Date.now();
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'ctx-2',
+      address: { channelType: 'feishu', chatId: 'group-2', userId: 'user-a' },
+      text: 'SKU 先排除测试品',
+      timestamp: baseTime,
+      contextOnly: true,
+      isGroup: true,
+      triggerReason: 'context_only',
+      senderName: 'Alice',
+    });
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'mention-1',
+      address: { channelType: 'feishu', chatId: 'group-2', userId: 'user-b' },
+      text: '帮我总结刚才的结论',
+      timestamp: baseTime + 1000,
+      isGroup: true,
+      isBotMentioned: true,
+      triggerReason: 'mention',
+      senderName: 'Bob',
+    });
+
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0].includes('<recent_group_context>'));
+    assert.ok(prompts[0].includes('SKU 先排除测试品'));
+    assert.ok(prompts[0].includes('<current_mention>'));
+    assert.ok(prompts[0].includes('帮我总结刚才的结论'));
+  });
+});
+
+function createMinimalAdapter(channelType: string, sent: OutboundMessage[]): BaseChannelAdapter {
+  return {
+    channelType,
+    start: async () => {},
+    stop: async () => {},
+    isRunning: () => true,
+    consumeOne: async () => null,
+    send: async (msg: OutboundMessage): Promise<SendResult> => {
+      sent.push(msg);
+      return { ok: true, messageId: `sent-${sent.length}` };
+    },
+  } as BaseChannelAdapter;
 }

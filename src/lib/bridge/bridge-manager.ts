@@ -59,6 +59,87 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
   return { intervalMs, minDeltaChars, maxChars };
 }
 
+
+interface GroupContextEntry {
+  id: string;
+  chatId: string;
+  threadId: string | null;
+  senderId?: string;
+  senderName?: string | null;
+  text: string;
+  createdAt: number;
+}
+
+const groupContextBuffer = new Map<string, GroupContextEntry[]>();
+
+function groupContextKey(msg: InboundMessage): string {
+  return `${msg.address.channelType}:${msg.address.chatId}:${msg.threadId || 'main'}`;
+}
+
+function getGroupContextConfig() {
+  const { store } = getBridgeContext();
+  const num = (key: string, fallback: number) => {
+    const value = parseInt(store.getSetting(key) || '', 10);
+    return Number.isFinite(value) && value > 0 ? value : fallback;
+  };
+  return {
+    maxMessages: num('bridge_feishu_group_context_max_messages', 20),
+    maxAgeMs: num('bridge_feishu_group_context_max_age_minutes', 60) * 60_000,
+    maxChars: num('bridge_feishu_group_context_max_chars', 8000),
+    perMessageMaxChars: num('bridge_feishu_group_context_per_message_max_chars', 800),
+  };
+}
+
+function appendGroupContext(msg: InboundMessage): void {
+  const text = msg.text.trim();
+  if (!text || msg.isSlashCommand) return;
+  const cfg = getGroupContextConfig();
+  const key = groupContextKey(msg);
+  const now = Date.now();
+  const createdAt = msg.timestamp || now;
+  const clipped = text.length > cfg.perMessageMaxChars
+    ? `${text.slice(0, cfg.perMessageMaxChars)}…[truncated]`
+    : text;
+  const existing = groupContextBuffer.get(key) || [];
+  if (existing.some((entry) => entry.id === msg.messageId)) return;
+  const fresh = existing
+    .filter((entry) => now - entry.createdAt <= cfg.maxAgeMs)
+    .concat({
+      id: msg.messageId,
+      chatId: msg.address.chatId,
+      threadId: msg.threadId || null,
+      senderId: msg.address.userId,
+      senderName: msg.senderName,
+      text: clipped,
+      createdAt,
+    })
+    .slice(-cfg.maxMessages);
+  groupContextBuffer.set(key, fresh);
+}
+
+function getRecentGroupContext(msg: InboundMessage): GroupContextEntry[] {
+  const cfg = getGroupContextConfig();
+  const key = groupContextKey(msg);
+  const now = Date.now();
+  let totalChars = 0;
+  const recent = (groupContextBuffer.get(key) || [])
+    .filter((entry) => entry.id !== msg.messageId)
+    .filter((entry) => entry.createdAt < (msg.timestamp || now))
+    .filter((entry) => now - entry.createdAt <= cfg.maxAgeMs)
+    .slice(-cfg.maxMessages)
+    .reverse()
+    .filter((entry) => {
+      totalChars += entry.text.length;
+      return totalChars <= cfg.maxChars;
+    })
+    .reverse();
+  return recent;
+}
+
+function clearGroupContext(msg: InboundMessage): void {
+  groupContextBuffer.delete(groupContextKey(msg));
+}
+
 /**
  * Check if a message looks like a numeric permission shortcut (1/2/3) for
  * feishu/qq channels WITH at least one pending permission in that chat.
@@ -474,6 +555,19 @@ async function handleMessage(
   const rawText = msg.text.trim();
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
 
+  if (msg.contextOnly) {
+    appendGroupContext(msg);
+    store.insertAuditLog({
+      channelType: adapter.channelType,
+      chatId: msg.address.chatId,
+      direction: 'inbound',
+      messageId: msg.messageId,
+      summary: `[CONTEXT_ONLY] Recorded group context (${rawText.length} chars)`,
+    });
+    ack();
+    return;
+  }
+
   // Handle attachment-only download failures — surface error to user instead of silently dropping
   if (!rawText && !hasAttachments) {
     const rawData = msg.raw as {
@@ -695,6 +789,7 @@ async function handleMessage(
     // Use text or empty string for image-only messages (prompt is still required by streamClaude)
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
+    const groupContext = msg.triggerReason === 'mention' ? getRecentGroupContext(msg) : undefined;
     const result = await engine.processMessage(binding, promptText, async (perm) => {
       await broker.forwardPermissionRequest(
         adapter,
@@ -706,7 +801,7 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, groupContext);
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
@@ -831,6 +926,7 @@ async function handleCommand(
       break;
 
     case '/new': {
+      clearGroupContext(msg);
       // Abort any running task on the current session before creating a new one
       const oldBinding = router.resolve(msg.address);
       const st = getState();

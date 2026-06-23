@@ -82,6 +82,8 @@ type FeishuMessageEventData = {
     message_type: string;
     content: string;
     create_time: string;
+    thread_id?: string;
+    root_id?: string;
     mentions?: Array<{
       key: string;
       id: { open_id?: string; union_id?: string; user_id?: string };
@@ -901,6 +903,17 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return allowed.includes(userId) || allowed.includes(chatId);
   }
 
+  private resolveGroupTriggerMode(): 'all' | 'mention' {
+    const store = getBridgeContext().store;
+    const mode = (store.getSetting('bridge_feishu_group_trigger_mode') || '').trim().toLowerCase();
+    if (mode === 'all' || mode === 'mention') return mode;
+
+    const legacyRequireMention = store.getSetting('bridge_feishu_require_mention');
+    if (legacyRequireMention === 'true') return 'mention';
+
+    return 'all';
+  }
+
   // ── Incoming event handler ──────────────────────────────────
 
   private async handleIncomingEvent(data: FeishuMessageEventData): Promise<void> {
@@ -959,22 +972,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         }
       }
 
-      // Require @mention check
-      const requireMention = getBridgeContext().store.getSetting('bridge_feishu_require_mention') !== 'false';
-      if (requireMention && !this.isBotMentioned(msg.mentions)) {
-        console.log('[feishu-adapter] Group message ignored (bot not @mentioned), chatId:', chatId, 'msgId:', msg.message_id);
-        try {
-          getBridgeContext().store.insertAuditLog({
-            channelType: 'feishu',
-            chatId,
-            direction: 'inbound',
-            messageId: msg.message_id,
-            summary: '[FILTERED] Group message dropped: bot not @mentioned (require_mention=true)',
-          });
-        } catch { /* best effort */ }
-        return;
-      }
     }
+
+    const isBotMentioned = isGroup ? this.isBotMentioned(msg.mentions) : false;
+    const groupTriggerMode = isGroup ? this.resolveGroupTriggerMode() : 'all';
 
     // Track last message ID per chat for typing indicator
     this.lastIncomingMessageId.set(chatId, msg.message_id);
@@ -1059,9 +1060,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
       chatId,
       userId,
     };
+    const threadId = msg.thread_id || msg.root_id || null;
 
     // [P1] Check for /perm text command (permission approval fallback)
     const trimmedText = text.trim();
+    const isSlashCommand = trimmedText.startsWith('/');
+    const contextOnly = isGroup && groupTriggerMode === 'mention' && !isBotMentioned && !isSlashCommand;
+    const triggerReason = contextOnly
+      ? 'context_only'
+      : isSlashCommand
+        ? 'slash_command'
+        : isGroup
+          ? (groupTriggerMode === 'mention' ? 'mention' : 'group_all')
+          : 'dm';
     if (trimmedText.startsWith('/perm ')) {
       const permParts = trimmedText.split(/\s+/);
       // /perm <action> <permId>
@@ -1076,6 +1087,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
           text: trimmedText,
           timestamp,
           callbackData,
+          isGroup,
+          isBotMentioned,
+          isSlashCommand,
+          triggerReason: 'slash_command',
+          threadId,
+          senderName: sender.sender_id?.user_id || null,
         };
         this.enqueue(inbound);
         return;
@@ -1088,13 +1105,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
       text: text.trim(),
       timestamp,
       attachments: attachments.length > 0 ? attachments : undefined,
+      contextOnly,
+      isGroup,
+      isBotMentioned,
+      isSlashCommand,
+      triggerReason,
+      threadId,
+      senderName: sender.sender_id?.user_id || null,
     };
 
     // Audit log
     try {
-      const summary = attachments.length > 0
-        ? `[${attachments.length} attachment(s)] ${text.slice(0, 150)}`
-        : text.slice(0, 200);
+      const summary = contextOnly
+        ? `[CONTEXT_ONLY] ${text.slice(0, 160)}`
+        : attachments.length > 0
+          ? `[${attachments.length} attachment(s)] ${text.slice(0, 150)}`
+          : text.slice(0, 200);
       getBridgeContext().store.insertAuditLog({
         channelType: 'feishu',
         chatId,

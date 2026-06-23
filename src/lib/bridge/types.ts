@@ -54,6 +54,20 @@ export interface InboundMessage {
   updateId?: number;
   /** File attachments (images, documents) from the IM channel */
   attachments?: import('./host.js').FileAttachment[];
+  /** True when the adapter observed the message only for ambient group context. */
+  contextOnly?: boolean;
+  /** Whether the message came from a group chat. */
+  isGroup?: boolean;
+  /** Whether the current bot was explicitly mentioned. */
+  isBotMentioned?: boolean;
+  /** Whether the message is a slash command. */
+  isSlashCommand?: boolean;
+  /** Adapter classification of why this message should or should not trigger the LLM. */
+  triggerReason?: 'dm' | 'group_all' | 'mention' | 'slash_command' | 'context_only';
+  /** Optional group thread/root identifier for context isolation. */
+  threadId?: string | null;
+  /** Human-readable sender name, if available. */
+  senderName?: string | null;
 }
 
 /** Outbound message to send to an IM channel */
