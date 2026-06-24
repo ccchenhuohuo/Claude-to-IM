@@ -45,6 +45,31 @@ const DEDUP_MAX = 1000;
 /** Max file download size (20 MB). */
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
+/** Strict textual fallback allowed only when structured bot identity is unavailable/incomplete. */
+const EXACT_BOT_MENTION_TEXT = '@VIJIM 战略助理';
+
+const CONTEXT_PLACEHOLDER_BY_TYPE: Record<string, string> = {
+  image: '[image]',
+  file: '[file]',
+  audio: '[audio]',
+  video: '[video]',
+  media: '[media]',
+  post: '[post image]',
+};
+
+function resolveFeishuDomainSetting(value?: string | null): lark.Domain {
+  const domain = (value || 'feishu')
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/\/+$/, '')
+    .split('/')[0];
+
+  return domain === 'lark' || domain === 'open.larksuite.com'
+    ? lark.Domain.Lark
+    : lark.Domain.Feishu;
+}
+
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
 
@@ -140,10 +165,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id') || '';
     const appSecret = getBridgeContext().store.getSetting('bridge_feishu_app_secret') || '';
-    const domainSetting = getBridgeContext().store.getSetting('bridge_feishu_domain') || 'feishu';
-    const domain = domainSetting === 'lark'
-      ? lark.Domain.Lark
-      : lark.Domain.Feishu;
+    const domainSetting = getBridgeContext().store.getSetting('bridge_feishu_domain');
+    const domain = resolveFeishuDomainSetting(domainSetting);
 
     // Create REST client
     this.restClient = new lark.Client({
@@ -913,9 +936,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (mode === 'all' || mode === 'mention') return mode;
 
     const legacyRequireMention = store.getSetting('bridge_feishu_require_mention');
-    if (legacyRequireMention === 'true') return 'mention';
+    if (legacyRequireMention === 'false') return 'all';
 
-    return 'all';
+    return 'mention';
   }
 
   // ── Incoming event handler ──────────────────────────────────
@@ -940,19 +963,31 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const cached = this.chatModeCache.get(msg.chat_id);
     if (cached !== undefined) return cached;
 
-    if (!this.restClient) return false;
-    try {
-      const res = await this.restClient.im.chat.get({
-        path: { chat_id: msg.chat_id },
-      });
-      const chat = res?.data as { chat_mode?: string; group_message_type?: string } | undefined;
-      const isGroup = chat?.chat_mode === 'group' || chat?.chat_mode === 'topic' || Boolean(chat?.group_message_type);
-      this.chatModeCache.set(msg.chat_id, isGroup);
-      return isGroup;
-    } catch (err) {
-      console.warn('[feishu-adapter] Failed to resolve chat mode:', err instanceof Error ? err.message : err);
-      return false;
+    if (this.restClient) {
+      try {
+        const res = await this.restClient.im.chat.get({
+          path: { chat_id: msg.chat_id },
+        });
+        const chat = res?.data as { chat_mode?: string; group_message_type?: string } | undefined;
+        if (chat?.chat_mode === 'group' || chat?.chat_mode === 'topic' || chat?.group_message_type) {
+          this.chatModeCache.set(msg.chat_id, true);
+          return true;
+        }
+        if (chat?.chat_mode === 'p2p') {
+          this.chatModeCache.set(msg.chat_id, false);
+          return false;
+        }
+      } catch (err) {
+        console.warn('[feishu-adapter] Failed to resolve chat mode:', err instanceof Error ? err.message : err);
+      }
     }
+
+    if (msg.chat_type === 'private' || !msg.chat_type) {
+      console.warn('[feishu-adapter] Ambiguous chat type; treating as group for safe routing, chatId:', msg.chat_id);
+      return true;
+    }
+
+    return false;
   }
 
   private async processIncomingEvent(data: FeishuMessageEventData): Promise<void> {
@@ -960,7 +995,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const sender = data.sender;
 
     // [P1] Filter out bot messages to prevent self-triggering loops
-    if (sender.sender_type === 'bot') return;
+    if (sender.sender_type === 'bot' || this.isSelfSender(sender)) return;
 
     // Dedup by message_id
     if (this.seenMessageIds.has(msg.message_id)) return;
@@ -1002,19 +1037,37 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     }
 
-    const isBotMentioned = isGroup ? this.isBotMentioned(msg.mentions) : false;
     const groupTriggerMode = isGroup ? this.resolveGroupTriggerMode() : 'all';
 
     // Track last message ID per chat for typing indicator
     this.lastIncomingMessageId.set(chatId, msg.message_id);
 
-    // Extract content based on message type
+    // Extract lightweight text first so mention-only context messages can avoid media downloads.
     const messageType = msg.message_type;
-    let text = '';
+    let text = this.extractLightweightText(msg);
+    const isBotMentioned = isGroup ? this.isBotMentioned(msg.mentions, text) : false;
+    text = this.stripMentionMarkers(text);
+    const trimmedTextForTrigger = text.trim();
+    const isSlashCommand = trimmedTextForTrigger.startsWith('/');
+    const contextOnly = isGroup && groupTriggerMode === 'mention' && !isBotMentioned && !isSlashCommand;
+    const triggerReason = contextOnly
+      ? 'context_only'
+      : isSlashCommand
+        ? 'slash_command'
+        : isGroup
+          ? (groupTriggerMode === 'mention' ? 'mention' : 'group_all')
+          : 'dm';
+
+    if (contextOnly && messageType !== 'text') {
+      text = [trimmedTextForTrigger, CONTEXT_PLACEHOLDER_BY_TYPE[messageType] || `[${messageType}]`]
+        .filter(Boolean)
+        .join(' ');
+    }
+
     const attachments: FileAttachment[] = [];
 
-    if (messageType === 'text') {
-      text = this.parseTextContent(msg.content);
+    if (messageType === 'text' || contextOnly) {
+      // Text is already parsed above; context-only media deliberately skips resource download.
     } else if (messageType === 'image') {
       // [P1] Download image with failure fallback
       console.log('[feishu-adapter] Image message received, content:', msg.content);
@@ -1077,9 +1130,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return;
     }
 
-    // Strip @mention markers from text
-    text = this.stripMentionMarkers(text);
-
     if (!text.trim() && attachments.length === 0) return;
 
     const timestamp = parseInt(msg.create_time, 10) || Date.now();
@@ -1092,15 +1142,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     // [P1] Check for /perm text command (permission approval fallback)
     const trimmedText = text.trim();
-    const isSlashCommand = trimmedText.startsWith('/');
-    const contextOnly = isGroup && groupTriggerMode === 'mention' && !isBotMentioned && !isSlashCommand;
-    const triggerReason = contextOnly
-      ? 'context_only'
-      : isSlashCommand
-        ? 'slash_command'
-        : isGroup
-          ? (groupTriggerMode === 'mention' ? 'mention' : 'group_all')
-          : 'dm';
     if (trimmedText.startsWith('/perm ')) {
       const permParts = trimmedText.split(/\s+/);
       // /perm <action> <permId>
@@ -1170,6 +1211,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     } catch {
       return content;
     }
+  }
+
+  private extractLightweightText(msg: FeishuMessageEventData['message']): string {
+    if (msg.message_type === 'text') return this.parseTextContent(msg.content);
+    if (msg.message_type === 'post') return this.parsePostContent(msg.content).extractedText;
+    return '';
   }
 
   /**
@@ -1259,13 +1306,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
         signal: AbortSignal.timeout(10_000),
       });
       const botData: any = await botRes.json();
-      if (botData?.bot?.open_id) {
-        this.botOpenId = botData.bot.open_id;
-        this.botIds.add(botData.bot.open_id);
-      }
-      // Also record app_id-based IDs if available
-      if (botData?.bot?.bot_id) {
-        this.botIds.add(botData.bot.bot_id);
+      const bot = botData?.bot;
+      this.addBotId(bot?.open_id);
+      this.addBotId(bot?.user_id);
+      this.addBotId(bot?.union_id);
+      this.addBotId(bot?.bot_id);
+      if (bot?.open_id) {
+        this.botOpenId = bot.open_id;
       }
       if (!this.botOpenId) {
         console.warn('[feishu-adapter] Could not resolve bot open_id');
@@ -1280,22 +1327,46 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   // ── @Mention detection ──────────────────────────────────────
 
+  private addBotId(id: unknown): void {
+    if (typeof id === 'string' && id.trim()) {
+      this.botIds.add(id.trim());
+    }
+  }
+
+  private isSelfSender(sender: FeishuMessageEventData['sender']): boolean {
+    if (this.botIds.size === 0) return false;
+    const ids = [
+      sender.sender_id?.open_id,
+      sender.sender_id?.user_id,
+      sender.sender_id?.union_id,
+    ].filter(Boolean) as string[];
+    return ids.some((id) => this.botIds.has(id));
+  }
+
   /**
-   * [P2] Check if bot is mentioned — matches against open_id, user_id, union_id.
+   * [P2] Check if bot is mentioned — structured ID match first, exact text fallback only when identity is unavailable.
    */
   private isBotMentioned(
     mentions?: FeishuMessageEventData['message']['mentions'],
+    text = '',
   ): boolean {
-    if (!mentions || this.botIds.size === 0) return false;
-    return mentions.some((m) => {
-      const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(Boolean) as string[];
-      return ids.some((id) => this.botIds.has(id));
-    });
+    if (mentions && this.botIds.size > 0) {
+      const matched = mentions.some((m) => {
+        const ids = [m.id.open_id, m.id.user_id, m.id.union_id].filter(Boolean) as string[];
+        return ids.some((id) => this.botIds.has(id));
+      });
+      if (matched) return true;
+    }
+
+    return this.botIds.size === 0 && text.includes(EXACT_BOT_MENTION_TEXT);
   }
 
   private stripMentionMarkers(text: string): string {
-    // Feishu uses @_user_N placeholders for mentions
-    return text.replace(/@_user_\d+/g, '').trim();
+    // Feishu uses @_user_N placeholders for mentions. Only strip our exact fallback name, not arbitrary @ text.
+    return text
+      .replace(/@_user_\d+/g, '')
+      .replaceAll(EXACT_BOT_MENTION_TEXT, '')
+      .trim();
   }
 
   // ── Resource download ───────────────────────────────────────
