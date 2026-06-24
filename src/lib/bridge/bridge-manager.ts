@@ -87,13 +87,17 @@ function getGroupContextConfig() {
     maxAgeMs: num('bridge_feishu_group_context_max_age_minutes', 60) * 60_000,
     maxChars: num('bridge_feishu_group_context_max_chars', 8000),
     perMessageMaxChars: num('bridge_feishu_group_context_per_message_max_chars', 800),
+    maxKeys: num('bridge_feishu_group_context_max_keys', 100),
   };
 }
 
-function appendGroupContext(msg: InboundMessage): void {
-  const text = msg.text.trim();
-  if (!text || msg.isSlashCommand) return;
+function appendGroupContext(msg: InboundMessage): { rawLength: number; storedLength: number; truncated: boolean } | null {
+  const rawText = msg.text.trim();
+  if (!rawText || msg.isSlashCommand) return null;
   const cfg = getGroupContextConfig();
+  const sanitized = sanitizeInput(rawText, cfg.perMessageMaxChars);
+  const text = sanitized.text.trim();
+  if (!text) return { rawLength: rawText.length, storedLength: 0, truncated: sanitized.truncated };
   const key = groupContextKey(msg);
   const now = Date.now();
   const createdAt = msg.timestamp || now;
@@ -101,7 +105,9 @@ function appendGroupContext(msg: InboundMessage): void {
     ? `${text.slice(0, cfg.perMessageMaxChars)}…[truncated]`
     : text;
   const existing = groupContextBuffer.get(key) || [];
-  if (existing.some((entry) => entry.id === msg.messageId)) return;
+  if (existing.some((entry) => entry.id === msg.messageId)) {
+    return { rawLength: rawText.length, storedLength: clipped.length, truncated: sanitized.truncated };
+  }
   const fresh = existing
     .filter((entry) => now - entry.createdAt <= cfg.maxAgeMs)
     .concat({
@@ -115,6 +121,33 @@ function appendGroupContext(msg: InboundMessage): void {
     })
     .slice(-cfg.maxMessages);
   groupContextBuffer.set(key, fresh);
+  pruneGroupContextBuffer(now, cfg.maxAgeMs, cfg.maxKeys);
+  return { rawLength: rawText.length, storedLength: clipped.length, truncated: sanitized.truncated };
+}
+
+function pruneGroupContextBuffer(now = Date.now(), maxAgeMs = getGroupContextConfig().maxAgeMs, maxKeys = getGroupContextConfig().maxKeys): void {
+  for (const [key, entries] of groupContextBuffer) {
+    const fresh = entries.filter((entry) => now - entry.createdAt <= maxAgeMs);
+    if (fresh.length === 0) {
+      groupContextBuffer.delete(key);
+    } else if (fresh.length !== entries.length) {
+      groupContextBuffer.set(key, fresh);
+    }
+  }
+
+  while (groupContextBuffer.size > maxKeys) {
+    let oldestKey: string | null = null;
+    let oldestCreatedAt = Infinity;
+    for (const [key, entries] of groupContextBuffer) {
+      const first = entries[0];
+      if (first && first.createdAt < oldestCreatedAt) {
+        oldestCreatedAt = first.createdAt;
+        oldestKey = key;
+      }
+    }
+    if (!oldestKey) break;
+    groupContextBuffer.delete(oldestKey);
+  }
 }
 
 function getRecentGroupContext(msg: InboundMessage): GroupContextEntry[] {
@@ -393,6 +426,7 @@ export async function stop(): Promise<void> {
   state.adapters.clear();
   state.adapterMeta.clear();
   state.startedAt = null;
+  groupContextBuffer.clear();
 
   // Notify host that bridge stopped
   lifecycle.onBridgeStop?.();
@@ -465,30 +499,7 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
         const msg = await adapter.consumeOne();
         if (!msg) continue; // Adapter stopped
 
-        // Callback queries, commands, and numeric permission shortcuts are
-        // lightweight — process inline (outside session lock).
-        // Regular messages use per-session locking for concurrency.
-        //
-        // IMPORTANT: numeric shortcuts (1/2/3) for feishu/qq MUST run outside
-        // the session lock. The current session is blocked waiting for the
-        // permission to be resolved; if "1" enters the session lock queue it
-        // deadlocks (permission waits for "1", "1" waits for lock release).
-        if (
-          msg.callbackData ||
-          msg.text.trim().startsWith('/') ||
-          isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId)
-        ) {
-          await handleMessage(adapter, msg);
-        } else {
-          const binding = router.resolve(msg.address);
-          // Fire-and-forget into session lock — loop continues to accept
-          // messages for other sessions immediately.
-          processWithSessionLock(binding.codepilotSessionId, () =>
-            handleMessage(adapter, msg),
-          ).catch(err => {
-            console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
-          });
-        }
+        await dispatchInboundMessage(adapter, msg);
       } catch (err) {
         if (abort.signal.aborted) break;
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -509,6 +520,36 @@ function runAdapterLoop(adapter: BaseChannelAdapter): void {
       meta.lastError = errMsg;
       state.adapterMeta.set(adapter.channelType, meta);
     }
+  });
+}
+
+async function dispatchInboundMessage(adapter: BaseChannelAdapter, msg: InboundMessage): Promise<void> {
+  // Callback queries, commands, context-only updates, and numeric permission shortcuts are
+  // lightweight — process inline (outside session lock). Context-only updates must stay
+  // here so they do not create a channel binding before being recorded as ambient context.
+  // Regular messages use per-session locking for concurrency.
+  //
+  // IMPORTANT: numeric shortcuts (1/2/3) for feishu/qq MUST run outside
+  // the session lock. The current session is blocked waiting for the
+  // permission to be resolved; if "1" enters the session lock queue it
+  // deadlocks (permission waits for "1", "1" waits for lock release).
+  if (
+    msg.contextOnly ||
+    msg.callbackData ||
+    msg.text.trim().startsWith('/') ||
+    isNumericPermissionShortcut(adapter.channelType, msg.text.trim(), msg.address.chatId)
+  ) {
+    await handleMessage(adapter, msg);
+    return;
+  }
+
+  const binding = router.resolve(msg.address);
+  // Fire-and-forget into session lock — loop continues to accept
+  // messages for other sessions immediately.
+  processWithSessionLock(binding.codepilotSessionId, () =>
+    handleMessage(adapter, msg),
+  ).catch(err => {
+    console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
   });
 }
 
@@ -556,13 +597,15 @@ async function handleMessage(
   const hasAttachments = msg.attachments && msg.attachments.length > 0;
 
   if (msg.contextOnly) {
-    appendGroupContext(msg);
+    const recorded = appendGroupContext(msg);
     store.insertAuditLog({
       channelType: adapter.channelType,
       chatId: msg.address.chatId,
       direction: 'inbound',
       messageId: msg.messageId,
-      summary: `[CONTEXT_ONLY] Recorded group context (${rawText.length} chars)`,
+      summary: recorded?.truncated
+        ? `[CONTEXT_ONLY][TRUNCATED] Recorded group context (${recorded.rawLength} -> ${recorded.storedLength} chars)`
+        : `[CONTEXT_ONLY] Recorded group context (${recorded?.storedLength ?? 0} chars)`,
     });
     ack();
     return;
@@ -1116,4 +1159,9 @@ export function computeSdkSessionUpdate(
 // Exposed so integration tests can exercise handleMessage directly
 // without wiring up the full adapter loop.
 /** @internal */
-export const _testOnly = { handleMessage };
+export const _testOnly = {
+  handleMessage,
+  dispatchInboundMessage,
+  getGroupContextBufferSize: () => groupContextBuffer.size,
+  clearGroupContextBuffer: () => groupContextBuffer.clear(),
+};
