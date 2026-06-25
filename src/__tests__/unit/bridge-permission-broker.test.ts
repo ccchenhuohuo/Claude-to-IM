@@ -10,13 +10,25 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import { handlePermissionCallback } from '../../lib/bridge/permission-broker';
+import { forwardPermissionRequest, handlePermissionCallback } from '../../lib/bridge/permission-broker';
 import type { BridgeStore, PermissionGateway, PermissionResolution } from '../../lib/bridge/host';
+import { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
+import type { InboundMessage, OutboundMessage, SendResult } from '../../lib/bridge/types';
 
 // ── Mock Store ──────────────────────────────────────────────
 
 function createMockStore() {
-  const links = new Map<string, { chatId: string; messageId: string; resolved: boolean; suggestions: string }>();
+  const links = new Map<string, {
+    permissionRequestId?: string;
+    channelType?: string;
+    chatId: string;
+    messageId: string;
+    sessionId?: string;
+    toolName?: string;
+    toolInput?: string;
+    resolved: boolean;
+    suggestions: string;
+  }>();
 
   return {
     links,
@@ -44,7 +56,9 @@ function createMockStore() {
     insertDedup: () => {},
     cleanupExpiredDedup: () => {},
     insertOutboundRef: () => {},
-    insertPermissionLink: () => {},
+    insertPermissionLink: (link: any) => {
+      links.set(link.permissionRequestId, { ...link, resolved: false });
+    },
     getPermissionLink: (id: string) => {
       return links.get(id) ?? null;
     },
@@ -77,6 +91,25 @@ function createMockGateway() {
 
 type MockStore = ReturnType<typeof createMockStore>;
 type MockGateway = ReturnType<typeof createMockGateway>;
+
+class MockAdapter extends BaseChannelAdapter {
+  readonly channelType = 'feishu' as const;
+
+  constructor(private sendResult: SendResult, readonly sent: OutboundMessage[] = []) {
+    super();
+  }
+
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  isRunning(): boolean { return true; }
+  async consumeOne(): Promise<InboundMessage | null> { return null; }
+  async send(message: OutboundMessage): Promise<SendResult> {
+    this.sent.push(message);
+    return this.sendResult;
+  }
+  validateConfig(): string | null { return null; }
+  isAuthorized(): boolean { return true; }
+}
 
 function setupContext(store: MockStore, gateway: MockGateway) {
   delete (globalThis as Record<string, unknown>)['__bridge_context__'];
@@ -200,5 +233,77 @@ describe('permission-broker', () => {
     assert.ok(result);
     assert.equal(gateway.resolved[0].resolution.behavior, 'allow');
     assert.ok((gateway.resolved[0].resolution as any).updatedPermissions);
+  });
+
+  it('does not claim a permission link for an invalid action', () => {
+    store.links.set('perm-invalid', {
+      permissionRequestId: 'perm-invalid',
+      channelType: 'feishu',
+      chatId: '123',
+      messageId: 'msg-invalid',
+      resolved: false,
+      suggestions: '',
+    });
+
+    assert.equal(handlePermissionCallback('perm:bogus:perm-invalid', '123', undefined, 'feishu'), false);
+    assert.equal(store.links.get('perm-invalid')?.resolved, false);
+    assert.equal(gateway.resolved.length, 0);
+  });
+
+  it('rejects callbacks from a different channel with the same chat id', () => {
+    store.links.set('perm-channel', {
+      permissionRequestId: 'perm-channel',
+      channelType: 'telegram',
+      chatId: 'same-chat',
+      messageId: 'msg-channel',
+      resolved: false,
+      suggestions: '',
+    });
+
+    assert.equal(handlePermissionCallback('perm:allow:perm-channel', 'same-chat', undefined, 'qq'), false);
+    assert.equal(store.links.get('perm-channel')?.resolved, false);
+    assert.equal(gateway.resolved.length, 0);
+  });
+
+  it('records permission metadata even when delivery returns no message id', async () => {
+    const adapter = new MockAdapter({ ok: true });
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'feishu', chatId: 'chat-meta' },
+      'perm-meta-1',
+      'Bash',
+      { command: 'pwd' },
+      'session-meta',
+      [{ type: 'addRules', rules: [{ toolName: 'Bash' }], behavior: 'allow', destination: 'session' }],
+    );
+
+    const link = store.getPermissionLink('perm-meta-1');
+    assert.ok(link);
+    assert.equal(link.messageId, '');
+    assert.equal(link.channelType, 'feishu');
+    assert.equal(link.sessionId, 'session-meta');
+    assert.equal(link.toolName, 'Bash');
+    assert.match(link.toolInput!, /pwd/);
+  });
+
+  it('denies the pending request when prompt delivery fails', async () => {
+    const adapter = new MockAdapter({ ok: false, error: 'bad request', httpStatus: 400 } as SendResult);
+
+    await forwardPermissionRequest(
+      adapter,
+      { channelType: 'feishu', chatId: 'chat-fail' },
+      'perm-fail-1',
+      'Bash',
+      { command: 'rm -rf /tmp/nope' },
+      'session-fail',
+      [],
+    );
+
+    assert.equal(store.getPermissionLink('perm-fail-1'), null);
+    assert.equal(gateway.resolved.length, 1);
+    assert.equal(gateway.resolved[0].id, 'perm-fail-1');
+    assert.equal(gateway.resolved[0].resolution.behavior, 'deny');
+    assert.match(gateway.resolved[0].resolution.message!, /delivery failed/i);
   });
 });

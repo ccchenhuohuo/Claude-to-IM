@@ -7,7 +7,7 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { BridgeOwner, BridgeStatus, ChannelAddress, ChannelBinding, InboundMessage, OutboundMessage, SendResult, StreamingPreviewState, ToolCallInfo } from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -45,13 +45,14 @@ interface StreamConfig {
 
 /** Default stream config per channel type. */
 const STREAM_DEFAULTS: Record<string, StreamConfig> = {
+  feishu: { intervalMs: 1000, minDeltaChars: 30, maxChars: 6000 },
   telegram: { intervalMs: 700, minDeltaChars: 20, maxChars: 3900 },
   discord: { intervalMs: 1500, minDeltaChars: 40, maxChars: 1900 },
 };
 
-function getStreamConfig(channelType = 'telegram'): StreamConfig {
+function getStreamConfig(channelType = 'feishu'): StreamConfig {
   const { store } = getBridgeContext();
-  const defaults = STREAM_DEFAULTS[channelType] || STREAM_DEFAULTS.telegram;
+  const defaults = STREAM_DEFAULTS[channelType] || STREAM_DEFAULTS.feishu;
   const prefix = `bridge_${channelType}_stream_`;
   const intervalMs = parseInt(store.getSetting(`${prefix}interval_ms`) || '', 10) || defaults.intervalMs;
   const minDeltaChars = parseInt(store.getSetting(`${prefix}min_delta_chars`) || '', 10) || defaults.minDeltaChars;
@@ -74,6 +75,16 @@ const groupContextBuffer = new Map<string, GroupContextEntry[]>();
 
 function groupContextKey(msg: InboundMessage): string {
   return `${msg.address.channelType}:${msg.address.chatId}:${msg.threadId || 'main'}`;
+}
+
+function routingOptionsFor(msg: InboundMessage): router.RoutingOptions {
+  return { chatType: messageChatType(msg) };
+}
+
+function messageChatType(msg: InboundMessage): BridgeOwner['chatType'] {
+  if (msg.isGroup === true) return 'group';
+  if (msg.isGroup === false) return 'private';
+  return msg.address.chatType || 'unknown';
 }
 
 function getGroupContextConfig() {
@@ -187,7 +198,7 @@ function isNumericPermissionShortcut(channelType: string, rawText: string, chatI
   const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
   if (!/^[123]$/.test(normalized)) return false;
   const { store } = getBridgeContext();
-  const pending = store.listPendingPermissionLinksByChat(chatId);
+  const pending = store.listPendingPermissionLinksByChat(chatId, channelType);
   return pending.length > 0; // any pending → route to inline path
 }
 
@@ -216,8 +227,6 @@ function flushPreview(
 
 // ── Channel-aware rendering dispatch ──────────────────────────
 
-import type { ChannelAddress, SendResult } from './types.js';
-
 /**
  * Render response text and deliver via the appropriate channel format.
  * Telegram: Markdown → HTML chunks via deliverRendered.
@@ -229,11 +238,12 @@ async function deliverResponse(
   responseText: string,
   sessionId: string,
   replyToMessageId?: string,
+  shouldContinue?: () => boolean,
 ): Promise<SendResult> {
   if (adapter.channelType === 'telegram') {
     const chunks = markdownToTelegramChunks(responseText, 4096);
     if (chunks.length > 0) {
-      return deliverRendered(adapter, address, chunks, { sessionId, replyToMessageId });
+      return deliverRendered(adapter, address, chunks, { sessionId, replyToMessageId, shouldContinue });
     }
     return { ok: true };
   }
@@ -246,7 +256,7 @@ async function deliverResponse(
         text: chunks[i].text,
         parseMode: 'Markdown',
         replyToMessageId,
-      }, { sessionId });
+      }, { sessionId, shouldContinue });
       if (!result.ok) return result;
     }
     return { ok: true };
@@ -258,7 +268,7 @@ async function deliverResponse(
       text: responseText,
       parseMode: 'Markdown',
       replyToMessageId,
-    }, { sessionId });
+    }, { sessionId, shouldContinue });
   }
   // Generic fallback: deliver as plain text (deliver() handles chunking internally)
   return deliver(adapter, {
@@ -266,7 +276,7 @@ async function deliverResponse(
     text: responseText,
     parseMode: 'plain',
     replyToMessageId,
-  }, { sessionId });
+  }, { sessionId, shouldContinue });
 }
 
 interface AdapterMeta {
@@ -281,6 +291,7 @@ interface BridgeManagerState {
   startedAt: string | null;
   loopAborts: Map<string, AbortController>;
   activeTasks: Map<string, AbortController>;
+  titleTasks: Set<string>;
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
   autoStartChecked: boolean;
@@ -296,6 +307,7 @@ function getState(): BridgeManagerState {
       startedAt: null,
       loopAborts: new Map(),
       activeTasks: new Map(),
+      titleTasks: new Set(),
       sessionLocks: new Map(),
       autoStartChecked: false,
     };
@@ -303,6 +315,9 @@ function getState(): BridgeManagerState {
   // Backfill sessionLocks for states created before this field existed
   if (!g[GLOBAL_KEY].sessionLocks) {
     g[GLOBAL_KEY].sessionLocks = new Map();
+  }
+  if (!g[GLOBAL_KEY].titleTasks) {
+    g[GLOBAL_KEY].titleTasks = new Set();
   }
   return g[GLOBAL_KEY];
 }
@@ -324,6 +339,39 @@ function processWithSessionLock(sessionId: string, fn: () => Promise<void>): Pro
     }
   }).catch(() => {});
   return current;
+}
+
+function isCurrentBindingSnapshot(msg: InboundMessage, snapshot: {
+  id: string;
+  codepilotSessionId: string;
+  generation?: number;
+}): boolean {
+  const { store } = getBridgeContext();
+  const current = store.getChannelBinding(msg.address.channelType, msg.address.chatId);
+  if (!current) return false;
+  return current.id === snapshot.id
+    && current.codepilotSessionId === snapshot.codepilotSessionId
+    && (current.generation || 0) === (snapshot.generation || 0);
+}
+
+function acknowledgeMessage(adapter: BaseChannelAdapter, msg: InboundMessage): void {
+  if (msg.updateId != null && adapter.acknowledgeUpdate) {
+    adapter.acknowledgeUpdate(msg.updateId);
+  }
+}
+
+function abortActiveTaskForBinding(binding: ChannelBinding | null | undefined): void {
+  if (!binding) return;
+  const state = getState();
+  const taskAbort = state.activeTasks.get(binding.codepilotSessionId);
+  if (!taskAbort) return;
+  taskAbort.abort();
+  state.activeTasks.delete(binding.codepilotSessionId);
+}
+
+function abortCurrentTaskForChat(address: ChannelAddress): void {
+  const { store } = getBridgeContext();
+  abortActiveTaskForBinding(store.getChannelBinding(address.channelType, address.chatId));
 }
 
 /**
@@ -543,12 +591,29 @@ async function dispatchInboundMessage(adapter: BaseChannelAdapter, msg: InboundM
     return;
   }
 
-  const binding = router.resolve(msg.address);
+  const binding = router.resolve(msg.address, routingOptionsFor(msg));
+  const snapshot = {
+    id: binding.id,
+    codepilotSessionId: binding.codepilotSessionId,
+    generation: binding.generation,
+  };
   // Fire-and-forget into session lock — loop continues to accept
   // messages for other sessions immediately.
-  processWithSessionLock(binding.codepilotSessionId, () =>
-    handleMessage(adapter, msg),
-  ).catch(err => {
+  processWithSessionLock(binding.codepilotSessionId, async () => {
+    if (!isCurrentBindingSnapshot(msg, snapshot)) {
+      const { store } = getBridgeContext();
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: '[STALE_BINDING] Dropped queued message after session changed',
+      });
+      acknowledgeMessage(adapter, msg);
+      return;
+    }
+    await handleMessage(adapter, msg);
+  }).catch(err => {
     console.error(`[bridge-manager] Session ${binding.codepilotSessionId.slice(0, 8)} error:`, err);
   });
 }
@@ -579,7 +644,16 @@ async function handleMessage(
 
   // Handle callback queries (permission buttons)
   if (msg.callbackData) {
-    const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
+    if (msg.callbackData.startsWith('perm:') && await rejectUnauthorizedFeishuCommand(adapter, msg)) {
+      ack();
+      return;
+    }
+    const handled = broker.handlePermissionCallback(
+      msg.callbackData,
+      msg.address.chatId,
+      msg.callbackMessageId,
+      adapter.channelType,
+    );
     if (handled) {
       // Send confirmation
       const confirmMsg: OutboundMessage = {
@@ -656,13 +730,17 @@ async function handleMessage(
     // eslint-disable-next-line no-control-regex
     const normalized = rawText.normalize('NFKC').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
     if (/^[123]$/.test(normalized)) {
-      const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId);
+      if (await rejectUnauthorizedFeishuCommand(adapter, msg)) {
+        ack();
+        return;
+      }
+      const pendingLinks = store.listPendingPermissionLinksByChat(msg.address.chatId, adapter.channelType);
       if (pendingLinks.length === 1) {
         const actionMap: Record<string, string> = { '1': 'allow', '2': 'allow_session', '3': 'deny' };
         const action = actionMap[normalized];
         const permId = pendingLinks[0].permissionRequestId;
         const callbackData = `perm:${action}:${permId}`;
-        const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
+        const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId, undefined, adapter.channelType);
         const label = normalized === '1' ? 'Allow' : normalized === '2' ? 'Allow Session' : 'Deny';
         if (handled) {
           await deliver(adapter, {
@@ -724,13 +802,21 @@ async function handleMessage(
   if (!text && !hasAttachments) { ack(); return; }
 
   // Regular message — route to conversation engine
-  const binding = router.resolve(msg.address);
+  const binding = router.resolve(msg.address, routingOptionsFor(msg));
+  const processingSnapshot = {
+    id: binding.id,
+    codepilotSessionId: binding.codepilotSessionId,
+    generation: binding.generation,
+  };
+  const taskAbort = new AbortController();
+  const isProcessingBindingCurrent = () => !taskAbort.signal.aborted && isCurrentBindingSnapshot(msg, processingSnapshot);
+  scheduleSessionTitleGeneration(binding, text);
+  appendOwnerChatLog(binding, msg, 'user', 'inbound', text);
 
   // Notify adapter that message processing is starting (e.g., typing indicator)
   adapter.onMessageStart?.(msg.address.chatId);
 
   // Create an AbortController so /stop can cancel this task externally
-  const taskAbort = new AbortController();
   const state = getState();
   state.activeTasks.set(binding.codepilotSessionId, taskAbort);
 
@@ -753,6 +839,7 @@ async function handleMessage(
 
   // Build the preview onPartialText callback (or undefined if preview not supported)
   const previewOnPartialText = (previewState && streamCfg) ? (fullText: string) => {
+    if (!isProcessingBindingCurrent()) return;
     const ps = previewState!;
     const cfg = streamCfg!;
     if (ps.degraded) return;
@@ -770,6 +857,7 @@ async function handleMessage(
       if (!ps.throttleTimer) {
         ps.throttleTimer = setTimeout(() => {
           ps.throttleTimer = null;
+          if (!isProcessingBindingCurrent()) return;
           if (!ps.degraded) flushPreview(adapter, ps, cfg);
         }, cfg.intervalMs);
       }
@@ -781,6 +869,7 @@ async function handleMessage(
       if (!ps.throttleTimer) {
         ps.throttleTimer = setTimeout(() => {
           ps.throttleTimer = null;
+          if (!isProcessingBindingCurrent()) return;
           if (!ps.degraded) flushPreview(adapter, ps, cfg);
         }, cfg.intervalMs - elapsed);
       }
@@ -802,12 +891,32 @@ async function handleMessage(
   // uses cards instead of message edit for streaming.
   const hasStreamingCards = typeof adapter.onStreamText === 'function';
   const toolCallTracker = new Map<string, ToolCallInfo>();
+  let staleResponseDropped = false;
+  const dropIfProcessingBindingChanged = async (interruptStreamingCard: boolean): Promise<boolean> => {
+    if (isProcessingBindingCurrent()) return false;
+    if (!staleResponseDropped) {
+      staleResponseDropped = true;
+      if (interruptStreamingCard && hasStreamingCards && adapter.onStreamEnd) {
+        try { await adapter.onStreamEnd(msg.address.chatId, 'interrupted', ''); } catch { /* best effort */ }
+      }
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        direction: 'outbound',
+        messageId: msg.messageId,
+        summary: '[STALE_BINDING] Dropped response after session changed',
+      });
+    }
+    return true;
+  };
 
   const onStreamCardText = hasStreamingCards ? (fullText: string) => {
+    if (!isProcessingBindingCurrent()) return;
     try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
   } : undefined;
 
   const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+    if (!isProcessingBindingCurrent()) return;
     if (toolName) {
       toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
     } else {
@@ -846,14 +955,20 @@ async function handleMessage(
       );
     }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, groupContext);
 
+    if (await dropIfProcessingBindingChanged(true)) return;
+
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card
     // was actually finalized (meaning content is already visible to the user).
     let cardFinalized = false;
     if (hasStreamingCards && adapter.onStreamEnd) {
       try {
+        if (await dropIfProcessingBindingChanged(true)) return;
         const status = result.hasError ? 'error' : 'completed';
-        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText);
+        cardFinalized = await adapter.onStreamEnd(msg.address.chatId, status, result.responseText, {
+          shouldContinue: isProcessingBindingCurrent,
+        });
+        if (await dropIfProcessingBindingChanged(false)) return;
       } catch (err) {
         console.warn('[bridge-manager] Card finalize failed:', err instanceof Error ? err.message : err);
       }
@@ -862,30 +977,48 @@ async function handleMessage(
     // Send response text — render via channel-appropriate format.
     // Skip if streaming card was finalized (content already in card).
     if (result.responseText) {
+      if (await dropIfProcessingBindingChanged(false)) return;
+      appendOwnerChatLog(binding, msg, 'assistant', 'outbound', result.responseText);
       if (!cardFinalized) {
-        await deliverResponse(adapter, msg.address, result.responseText, binding.codepilotSessionId, msg.messageId);
+        if (await dropIfProcessingBindingChanged(false)) return;
+        await deliverResponse(
+          adapter,
+          msg.address,
+          result.responseText,
+          binding.codepilotSessionId,
+          msg.messageId,
+          isProcessingBindingCurrent,
+        );
+        if (await dropIfProcessingBindingChanged(false)) return;
       }
     } else if (result.hasError) {
+      if (await dropIfProcessingBindingChanged(false)) return;
       const errorResponse: OutboundMessage = {
         address: msg.address,
         text: `<b>Error:</b> ${escapeHtml(result.errorMessage)}`,
         parseMode: 'HTML',
         replyToMessageId: msg.messageId,
       };
-      await deliver(adapter, errorResponse);
+      if (await dropIfProcessingBindingChanged(false)) return;
+      await deliver(adapter, errorResponse, { shouldContinue: isProcessingBindingCurrent });
+      if (await dropIfProcessingBindingChanged(false)) return;
     }
 
     // Persist the actual SDK session ID for future resume.
     // If the result has an error and no session ID was captured, clear the
     // stale ID so the next message starts fresh instead of retrying a broken resume.
-    if (binding.id) {
-      try {
-        const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
-        if (update !== null) {
+    if (await dropIfProcessingBindingChanged(false)) return;
+    try {
+      const update = computeSdkSessionUpdate(result.sdkSessionId, result.hasError);
+      if (update !== null) {
+        if (await dropIfProcessingBindingChanged(false)) return;
+        store.updateSdkSessionId(binding.codepilotSessionId, update);
+        if (binding.id) {
+          if (await dropIfProcessingBindingChanged(false)) return;
           store.updateChannelBinding(binding.id, { sdkSessionId: update });
         }
-      } catch { /* best effort */ }
-    }
+      }
+    } catch { /* best effort */ }
   } finally {
     // Clean up preview state
     if (previewState) {
@@ -914,6 +1047,171 @@ async function handleMessage(
 /**
  * Handle IM slash commands.
  */
+function splitCsvSetting(value: string | null): string[] {
+  return (value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function isFeishuCommandAuthorized(msg: InboundMessage): boolean {
+  if (msg.address.channelType !== 'feishu') return true;
+  const { store } = getBridgeContext();
+  const admins = splitCsvSetting(store.getSetting('bridge_feishu_command_admins'));
+  return admins.length === 0 || admins.includes(msg.address.userId || '');
+}
+
+async function rejectUnauthorizedFeishuCommand(
+  adapter: BaseChannelAdapter,
+  msg: InboundMessage,
+): Promise<boolean> {
+  if (isFeishuCommandAuthorized(msg)) return false;
+  await deliver(adapter, {
+    address: msg.address,
+    text: 'Command rejected: this Feishu user is not allowed to run slash commands.',
+    parseMode: 'plain',
+    replyToMessageId: msg.messageId,
+  });
+  return true;
+}
+
+function newTopicTitle(): string {
+  const formatter = new Intl.DateTimeFormat('sv-SE', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  return `新话题 ${formatter.format(new Date()).replace('T', ' ')}`;
+}
+
+function fallbackTitleFromText(text: string): string {
+  const cleaned = text
+    .replace(/\s+/g, ' ')
+    .replace(/[<>{}`]/g, '')
+    .trim();
+  if (!cleaned) return '新话题';
+  return cleaned.length > 32 ? `${cleaned.slice(0, 32)}...` : cleaned;
+}
+
+function normalizeGeneratedTitle(raw: string): string {
+  return raw
+    .replace(/\s+/g, ' ')
+    .replace(/^["'`“”‘’]+|["'`“”‘’]+$/g, '')
+    .replace(/^标题[:：]\s*/i, '')
+    .trim()
+    .slice(0, 60);
+}
+
+async function collectTitleText(stream: ReadableStream<string>): Promise<string> {
+  const reader = stream.getReader();
+  let output = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    for (const line of value.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      try {
+        const event = JSON.parse(line.slice(6)) as { type?: string; data?: string };
+        if (event.type === 'text' && typeof event.data === 'string') {
+          output += event.data;
+        }
+      } catch { /* ignore malformed stream chunks */ }
+    }
+  }
+  return normalizeGeneratedTitle(output);
+}
+
+function scheduleSessionTitleGeneration(binding: ChannelBinding, firstText: string): void {
+  const { store, llm } = getBridgeContext();
+  if (!store.updateSessionTitle) return;
+  const session = store.getSession(binding.codepilotSessionId);
+  if (!session || (session.titleStatus && !['pending', 'fallback'].includes(session.titleStatus))) return;
+
+  const state = getState();
+  if (state.titleTasks.has(binding.codepilotSessionId)) return;
+  state.titleTasks.add(binding.codepilotSessionId);
+
+  const fallback = fallbackTitleFromText(firstText);
+  if (!session.title || session.titleStatus === 'pending') {
+    try { store.updateSessionTitle(binding.codepilotSessionId, fallback, 'fallback'); } catch { /* best effort */ }
+  }
+
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), 30_000);
+  const prompt = [
+    '为下面这条飞书会话首条消息生成一个简短中文标题。',
+    '只输出标题本身，不要解释，不要引号，最多 18 个汉字或 8 个英文词。',
+    '',
+    firstText.slice(0, 1200),
+  ].join('\n');
+
+  void (async () => {
+    try {
+      const stream = llm.streamChat({
+        prompt,
+        sessionId: `${binding.codepilotSessionId}:title`,
+        model: binding.model || undefined,
+        workingDirectory: binding.workingDirectory || undefined,
+        abortController,
+        permissionMode: 'plan',
+        conversationHistory: [],
+      });
+      const title = await collectTitleText(stream);
+      if (title) {
+        const latest = store.getSession(binding.codepilotSessionId);
+        if (latest && (!latest.titleStatus || ['pending', 'fallback'].includes(latest.titleStatus))) {
+          store.updateSessionTitle?.(binding.codepilotSessionId, title, 'generated');
+        }
+      }
+    } catch (err) {
+      console.warn('[bridge-manager] Session title generation failed:', err instanceof Error ? err.message : err);
+    } finally {
+      clearTimeout(timeout);
+      state.titleTasks.delete(binding.codepilotSessionId);
+    }
+  })();
+}
+
+function appendOwnerChatLog(
+  binding: ChannelBinding,
+  msg: InboundMessage,
+  role: 'user' | 'assistant' | 'system',
+  direction: 'inbound' | 'outbound',
+  text: string,
+): void {
+  if (!binding.ownerKey || !text.trim()) return;
+  const { store } = getBridgeContext();
+  if (!store.appendOwnerChatLog) return;
+  try {
+    store.appendOwnerChatLog({
+      ownerKey: binding.ownerKey,
+      sessionId: binding.codepilotSessionId,
+      channelType: binding.channelType,
+      chatId: binding.chatId,
+      direction,
+      role,
+      messageId: msg.messageId,
+      senderId: direction === 'inbound' ? msg.address.userId : undefined,
+      senderName: direction === 'inbound' ? msg.senderName : undefined,
+      text,
+      triggerReason: msg.triggerReason,
+      createdAt: new Date(msg.timestamp || Date.now()).toISOString(),
+    });
+  } catch (err) {
+    console.warn('[bridge-manager] Failed to append owner chat log:', err instanceof Error ? err.message : err);
+  }
+}
+
+function sessionTimestamp(session: { lastActiveAt?: string; updatedAt?: string; createdAt?: string }): number {
+  const raw = session.lastActiveAt || session.updatedAt || session.createdAt || '';
+  const time = Date.parse(raw);
+  return Number.isFinite(time) ? time : 0;
+}
+
 async function handleCommand(
   adapter: BaseChannelAdapter,
   msg: InboundMessage,
@@ -947,21 +1245,27 @@ async function handleCommand(
   }
 
   let response = '';
+  const routeOptions = routingOptionsFor(msg);
+
+  if (await rejectUnauthorizedFeishuCommand(adapter, msg)) {
+    return;
+  }
 
   switch (command) {
     case '/start':
       response = [
-        '<b>CodePilot Bridge</b>',
+        '<b>Feishu Claude Bridge</b>',
         '',
         'Send any message to interact with Claude.',
         '',
         '<b>Commands:</b>',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
+        '/new - Start a new topic in this Feishu chat',
+        '/resume [session_id|number] - Resume a topic from this Feishu chat',
+        '/bind &lt;session_id&gt; - Bind to a topic owned by this Feishu chat',
+        '/cwd - Show the fixed lark workspace',
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
-        '/sessions - List recent sessions',
+        '/sessions - List topics for this Feishu chat',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
@@ -969,9 +1273,13 @@ async function handleCommand(
       break;
 
     case '/new': {
+      if (args) {
+        response = 'Path arguments are deprecated. Workspaces are fixed per Feishu chat; run /new without a path.';
+        break;
+      }
       clearGroupContext(msg);
       // Abort any running task on the current session before creating a new one
-      const oldBinding = router.resolve(msg.address);
+      const oldBinding = router.resolve(msg.address, routeOptions);
       const st = getState();
       const oldTask = st.activeTasks.get(oldBinding.codepilotSessionId);
       if (oldTask) {
@@ -979,17 +1287,17 @@ async function handleCommand(
         st.activeTasks.delete(oldBinding.codepilotSessionId);
       }
 
-      let workDir: string | undefined;
-      if (args) {
-        const validated = validateWorkingDirectory(args);
-        if (!validated) {
-          response = 'Invalid path. Must be an absolute path without traversal sequences.';
-          break;
-        }
-        workDir = validated;
-      }
-      const binding = router.createBinding(msg.address, workDir);
-      response = `New session created.\nSession: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>\nCWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
+      const binding = router.createBinding(msg.address, undefined, {
+        ...routeOptions,
+        title: newTopicTitle(),
+      });
+      const session = store.getSession(binding.codepilotSessionId);
+      response = [
+        'New topic created.',
+        `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
+        `Title: <b>${escapeHtml(session?.title || 'New topic')}</b>`,
+        `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
+      ].join('\n');
       break;
     }
 
@@ -1002,28 +1310,79 @@ async function handleCommand(
         response = 'Invalid session ID format. Expected a 32-64 character hex/UUID string.';
         break;
       }
-      const binding = router.bindToSession(msg.address, args);
+      const previousBinding = store.getChannelBinding(msg.address.channelType, msg.address.chatId);
+      const binding = router.bindToSession(msg.address, args, routeOptions);
       if (binding) {
+        abortActiveTaskForBinding(previousBinding);
         response = `Bound to session <code>${args.slice(0, 8)}...</code>`;
       } else {
-        response = 'Session not found.';
+        response = 'Session not found for this Feishu chat.';
       }
       break;
     }
 
-    case '/cwd': {
+    case '/resume': {
+      const sessions = router
+        .listSessions(msg.address, routeOptions)
+        .sort((a, b) => sessionTimestamp(b) - sessionTimestamp(a));
       if (!args) {
-        response = 'Usage: /cwd /path/to/directory';
+        if (sessions.length === 0) {
+          response = 'No sessions found for this Feishu chat.';
+        } else {
+          const lines = ['<b>Sessions for this Feishu chat:</b>', ''];
+          sessions.slice(0, 10).forEach((session, index) => {
+            const title = session.title || session.id;
+            lines.push(`${index + 1}. <code>${session.id.slice(0, 8)}...</code> ${escapeHtml(title)}`);
+          });
+          lines.push('', 'Use /resume &lt;number&gt; or /resume &lt;session_id&gt;.');
+          response = lines.join('\n');
+        }
         break;
       }
-      const validatedPath = validateWorkingDirectory(args);
-      if (!validatedPath) {
-        response = 'Invalid path. Must be an absolute path without traversal sequences or special characters.';
+
+      let targetId = args;
+      if (/^\d+$/.test(args)) {
+        const index = Number(args) - 1;
+        if (index < 0 || index >= sessions.length) {
+          response = 'Session number not found for this Feishu chat.';
+          break;
+        }
+        targetId = sessions[index].id;
+      } else {
+        const matches = sessions.filter((session) => session.id === args || session.id.startsWith(args));
+        if (matches.length === 0) {
+          response = 'Session not found for this Feishu chat.';
+          break;
+        }
+        if (matches.length > 1) {
+          response = 'Session ID prefix is ambiguous. Use a longer session ID.';
+          break;
+        }
+        targetId = matches[0].id;
+      }
+
+      abortCurrentTaskForChat(msg.address);
+      const binding = router.bindToSession(msg.address, targetId, routeOptions);
+      if (!binding) {
+        response = 'Session not found for this Feishu chat.';
         break;
       }
-      const binding = router.resolve(msg.address);
-      router.updateBinding(binding.id, { workingDirectory: validatedPath });
-      response = `Working directory set to <code>${escapeHtml(validatedPath)}</code>`;
+      const session = store.getSession(binding.codepilotSessionId);
+      response = [
+        `Resumed session <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
+        `Title: <b>${escapeHtml(session?.title || binding.codepilotSessionId)}</b>`,
+        `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
+      ].join('\n');
+      break;
+    }
+
+    case '/cwd': {
+      if (args) {
+        response = 'Path arguments are deprecated. Workspaces are fixed per Feishu chat; /cwd only displays the current workspace.';
+        break;
+      }
+      const binding = router.resolve(msg.address, routeOptions);
+      response = `Working directory is fixed for this Feishu chat:\n<code>${escapeHtml(binding.workingDirectory || '~')}</code>`;
       break;
     }
 
@@ -1032,18 +1391,26 @@ async function handleCommand(
         response = 'Usage: /mode plan|code|ask';
         break;
       }
-      const binding = router.resolve(msg.address);
-      router.updateBinding(binding.id, { mode: args });
+      const binding = router.resolve(msg.address, routeOptions);
+      abortActiveTaskForBinding(binding);
+      store.updateSessionMode?.(binding.codepilotSessionId, args as 'code' | 'plan' | 'ask');
+      const generation = store.bumpSessionGeneration?.(binding.codepilotSessionId);
+      router.updateBinding(binding.id, {
+        mode: args,
+        ...(generation ? { generation } : {}),
+      });
       response = `Mode set to <b>${args}</b>`;
       break;
     }
 
     case '/status': {
-      const binding = router.resolve(msg.address);
+      const binding = router.resolve(msg.address, routeOptions);
+      const session = store.getSession(binding.codepilotSessionId);
       response = [
         '<b>Bridge Status</b>',
         '',
         `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
+        `Title: <b>${escapeHtml(session?.title || binding.codepilotSessionId)}</b>`,
         `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
         `Mode: <b>${binding.mode}</b>`,
         `Model: <code>${binding.model || 'default'}</code>`,
@@ -1052,22 +1419,24 @@ async function handleCommand(
     }
 
     case '/sessions': {
-      const bindings = router.listBindings(adapter.channelType);
-      if (bindings.length === 0) {
-        response = 'No sessions found.';
+      const sessions = router
+        .listSessions(msg.address, routeOptions)
+        .sort((a, b) => sessionTimestamp(b) - sessionTimestamp(a));
+      if (sessions.length === 0) {
+        response = 'No sessions found for this Feishu chat.';
       } else {
-        const lines = ['<b>Sessions:</b>', ''];
-        for (const b of bindings.slice(0, 10)) {
-          const active = b.active ? 'active' : 'inactive';
-          lines.push(`<code>${b.codepilotSessionId.slice(0, 8)}...</code> [${active}] ${escapeHtml(b.workingDirectory || '~')}`);
-        }
+        const lines = ['<b>Sessions for this Feishu chat:</b>', ''];
+        sessions.slice(0, 10).forEach((session, index) => {
+          const title = session.title || session.id;
+          lines.push(`${index + 1}. <code>${session.id.slice(0, 8)}...</code> ${escapeHtml(title)}`);
+        });
         response = lines.join('\n');
       }
       break;
     }
 
     case '/stop': {
-      const binding = router.resolve(msg.address);
+      const binding = router.resolve(msg.address, routeOptions);
       const st = getState();
       const taskAbort = st.activeTasks.get(binding.codepilotSessionId);
       if (taskAbort) {
@@ -1091,7 +1460,7 @@ async function handleCommand(
         break;
       }
       const callbackData = `perm:${permAction}:${permId}`;
-      const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId);
+      const handled = broker.handlePermissionCallback(callbackData, msg.address.chatId, undefined, adapter.channelType);
       if (handled) {
         response = `Permission ${permAction}: recorded.`;
       } else {
@@ -1102,17 +1471,18 @@ async function handleCommand(
 
     case '/help':
       response = [
-        '<b>CodePilot Bridge Commands</b>',
+        '<b>Feishu Claude Bridge Commands</b>',
         '',
-        '/new [path] - Start new session',
-        '/bind &lt;session_id&gt; - Bind to existing session',
-        '/cwd /path - Change working directory',
+        '/new - Start a new topic in this Feishu chat',
+        '/resume [session_id|number] - Resume a topic from this Feishu chat',
+        '/bind &lt;session_id&gt; - Bind to a topic owned by this Feishu chat',
+        '/cwd - Show the fixed lark workspace',
         '/mode plan|code|ask - Change mode',
         '/status - Show current status',
-        '/sessions - List recent sessions',
+        '/sessions - List topics for this Feishu chat',
         '/stop - Stop current session',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
-        '1/2/3 - Quick permission reply (Feishu/QQ/WeChat, single pending)',
+        '1/2/3 - Quick permission reply (Feishu, single pending)',
         '/help - Show this help',
       ].join('\n');
       break;
@@ -1162,6 +1532,7 @@ export function computeSdkSessionUpdate(
 export const _testOnly = {
   handleMessage,
   dispatchInboundMessage,
+  isNumericPermissionShortcut,
   getGroupContextBufferSize: () => groupContextBuffer.size,
   clearGroupContextBuffer: () => groupContextBuffer.clear(),
 };

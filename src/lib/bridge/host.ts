@@ -6,7 +6,7 @@
  * interfaces to use the bridge.
  */
 
-import type { ChannelBinding, ChannelType } from './types.js';
+import type { BridgeOwner, ChannelAddress, ChannelBinding, ChannelType } from './types.js';
 
 // ── Bridge-local types (replacing @/types imports) ────────────
 
@@ -70,14 +70,55 @@ export interface BridgeSession {
   id: string;
   working_directory: string;
   model: string;
+  ownerKey?: string;
+  title?: string;
+  titleStatus?: 'pending' | 'generated' | 'manual' | 'fallback';
+  generation?: number;
+  mode?: 'code' | 'plan' | 'ask';
   system_prompt?: string;
   provider_id?: string;
+  sdk_session_id?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  lastActiveAt?: string;
 }
 
 /** Minimal message object returned by the store. */
 export interface BridgeMessage {
   role: string;
   content: string;
+}
+
+export interface OwnerChatLogEntry {
+  ownerKey: string;
+  sessionId?: string;
+  channelType: string;
+  chatId: string;
+  direction: 'inbound' | 'outbound';
+  role: 'user' | 'assistant' | 'system';
+  messageId?: string;
+  senderId?: string;
+  senderName?: string | null;
+  text: string;
+  triggerReason?: string;
+  createdAt: string;
+}
+
+export interface OwnerChatLogQuery {
+  since?: string;
+  until?: string;
+  maxChars?: number;
+}
+
+export interface DreamingState {
+  ownerKey: string;
+  lastRunDate?: string;
+  lastRunAt?: string;
+  running?: boolean;
+  readmeHash?: string;
+  todoHash?: string;
+  status?: 'idle' | 'running' | 'completed' | 'skipped' | 'error' | 'conflict';
+  error?: string;
 }
 
 // ── Host Interface: Settings ─────────────────────────────────
@@ -103,17 +144,27 @@ export interface PermissionLinkInput {
   channelType: string;
   chatId: string;
   messageId: string;
+  sessionId?: string;
   toolName: string;
+  toolInput?: string;
   suggestions: string;
+  expiresAt?: string;
 }
 
 /** Stored permission link record. */
 export interface PermissionLinkRecord {
   permissionRequestId: string;
+  channelType?: string;
   chatId: string;
   messageId: string;
+  sessionId?: string;
+  toolName?: string;
+  toolInput?: string;
   resolved: boolean;
   suggestions: string;
+  createdAt?: string;
+  resolvedAt?: string;
+  expiresAt?: string;
 }
 
 /** Input for inserting an outbound reference. */
@@ -129,11 +180,21 @@ export interface OutboundRefInput {
 export interface UpsertChannelBindingInput {
   channelType: string;
   chatId: string;
+  ownerKey?: string;
   codepilotSessionId: string;
   sdkSessionId?: string;
   workingDirectory: string;
   model: string;
   mode?: string;
+  generation?: number;
+}
+
+export interface CreateOwnerSessionInput {
+  title?: string;
+  titleStatus?: BridgeSession['titleStatus'];
+  model: string;
+  systemPrompt?: string;
+  mode?: 'code' | 'plan' | 'ask';
 }
 
 /**
@@ -174,6 +235,7 @@ export interface BridgeStore {
   // ── SDK session ──
   updateSdkSessionId(sessionId: string, sdkSessionId: string): void;
   updateSessionModel(sessionId: string, model: string): void;
+  updateSessionMode?(sessionId: string, mode: 'code' | 'plan' | 'ask'): void;
   syncSdkTasks(sessionId: string, todos: unknown): void;
 
   // ── Provider ──
@@ -192,11 +254,26 @@ export interface BridgeStore {
   getPermissionLink(permissionRequestId: string): PermissionLinkRecord | null;
   markPermissionLinkResolved(permissionRequestId: string): boolean;
   /** List unresolved permission links for a given chat. */
-  listPendingPermissionLinksByChat(chatId: string): PermissionLinkRecord[];
+  listPendingPermissionLinksByChat(chatId: string, channelType?: string): PermissionLinkRecord[];
 
   // ── Channel offsets (adapter watermarks) ──
   getChannelOffset(key: string): string;
   setChannelOffset(key: string, offset: string): void;
+
+  // ── Owner-scoped Feishu sessions (optional for older hosts) ──
+  getOrCreateOwner?(address: ChannelAddress, chatType?: BridgeOwner['chatType']): BridgeOwner;
+  getOwnerWorkspace?(ownerKey: string): string;
+  listSessionsByOwner?(ownerKey: string): BridgeSession[];
+  createSessionForOwner?(ownerKey: string, input: CreateOwnerSessionInput): BridgeSession;
+  updateSessionTitle?(sessionId: string, title: string, titleStatus?: BridgeSession['titleStatus']): void;
+  bumpSessionGeneration?(sessionId: string): number;
+
+  // ── Owner chat logs and dreaming (optional) ──
+  listOwners?(): BridgeOwner[];
+  appendOwnerChatLog?(entry: OwnerChatLogEntry): void;
+  getOwnerChatLogs?(ownerKey: string, query?: OwnerChatLogQuery): OwnerChatLogEntry[];
+  getDreamingState?(ownerKey: string): DreamingState | null;
+  updateDreamingState?(ownerKey: string, patch: Partial<DreamingState>): DreamingState;
 }
 
 // ── Host Interface: LLM Provider ─────────────────────────────

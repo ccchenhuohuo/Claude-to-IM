@@ -1,14 +1,14 @@
 # Claude-to-IM
 
-A host-agnostic bridge that connects IM platforms (Telegram, Discord, Feishu/Lark) to Claude, enabling AI-powered conversations through messaging apps.
+A host-agnostic bridge that connects Feishu/Lark to Claude, enabling AI-powered conversations through Feishu chats.
 
 ## Features
 
-- **Multi-platform**: Telegram (long polling), Discord (Gateway), Feishu/Lark (WSClient)
+- **Feishu/Lark runtime adapter**: WSClient long-connection integration
 - **Streaming previews**: Real-time response drafts via message editing
 - **Permission management**: Interactive inline buttons for tool approvals
 - **Session binding**: Each IM chat maps to a persistent conversation session
-- **Markdown rendering**: Platform-native formatting (HTML for Telegram, Discord Markdown, Feishu cards)
+- **Markdown rendering**: Feishu rich text/cards
 - **Security**: Input validation, rate limiting, authorization, audit logging
 - **Reliable delivery**: Auto-chunking, retry with backoff, HTML fallback, dedup
 
@@ -16,7 +16,7 @@ A host-agnostic bridge that connects IM platforms (Telegram, Discord, Feishu/Lar
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│  IM Platform (Telegram / Discord / Feishu)                   │
+│  Feishu / Lark                                                │
 └──────────────┬───────────────────────────────────────────────┘
                │ InboundMessage
 ┌──────────────▼───────────────────────────────────────────────┐
@@ -69,7 +69,7 @@ await bridgeManager.start();
 
 ```typescript
 const status = bridgeManager.getStatus();
-// { running: true, adapters: [{ channelType: 'telegram', running: true, ... }] }
+// { running: true, adapters: [{ channelType: 'feishu', running: true, ... }] }
 ```
 
 ## Host Interfaces
@@ -101,16 +101,16 @@ All settings are read via `BridgeStore.getSetting(key)`. Key settings:
 
 - `remote_bridge_enabled` — master switch
 - `bridge_auto_start` — auto-start on app launch
-- `bridge_{adapter}_enabled` — per-adapter toggle
-- `bridge_{adapter}_bot_token` — bot credentials
-- `bridge_{adapter}_allowed_users` — CSV of authorized user IDs
-- `bridge_{adapter}_stream_enabled` — streaming preview toggle
+- `bridge_feishu_enabled` — Feishu adapter toggle
+- `bridge_feishu_app_id` / `bridge_feishu_app_secret` — app credentials
+- `bridge_feishu_allowed_users` — CSV of authorized user IDs
+- `bridge_feishu_stream_enabled` — streaming preview toggle
 
 ## Security
 
 - Input validation: path traversal, command injection, null byte detection
 - Rate limiting: 20 messages/minute per chat (token bucket)
-- Authorization: per-adapter allowed users/channels/guilds
+- Authorization: Feishu allowed users/chats
 - Audit logging: all inbound/outbound messages logged
 - Permission dedup: atomic claim-and-resolve prevents double-clicks
 

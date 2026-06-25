@@ -12,7 +12,7 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
-import { deliver } from '../../lib/bridge/delivery-layer';
+import { deliver, deliverRendered } from '../../lib/bridge/delivery-layer';
 import type { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
 import type { BridgeStore, LLMProvider, PermissionGateway, LifecycleHooks } from '../../lib/bridge/host';
 import type { OutboundMessage, SendResult } from '../../lib/bridge/types';
@@ -202,5 +202,36 @@ describe('delivery-layer', () => {
 
     assert.equal(result.ok, false);
     assert.ok(result.error);
+  });
+
+  it('does not send rendered incomplete-delivery notice after cancellation', async () => {
+    const sentMessages: string[] = [];
+    let shouldContinueCalls = 0;
+    const adapter = createMockAdapter({
+      sendFn: async (msg) => {
+        sentMessages.push(msg.text);
+        if (sentMessages.length === 1) return { ok: true, messageId: 'msg-1' };
+        return { ok: false, error: 'Forbidden', httpStatus: 403 } as SendResult;
+      },
+    });
+
+    const result = await deliverRendered(
+      adapter,
+      { channelType: 'telegram', chatId: '123' },
+      [
+        { html: '<b>first</b>', text: 'first' },
+        { html: '<b>second</b>', text: 'second' },
+      ],
+      {
+        shouldContinue: () => {
+          shouldContinueCalls += 1;
+          return shouldContinueCalls <= 11;
+        },
+      },
+    );
+
+    assert.equal(result.ok, false);
+    assert.equal(result.error, 'Delivery cancelled');
+    assert.deepEqual(sentMessages, ['<b>first</b>', '<b>second</b>']);
   });
 });

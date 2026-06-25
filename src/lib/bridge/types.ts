@@ -24,6 +24,7 @@ export interface ChannelAddress {
   chatId: string;        // Platform-specific chat/channel identifier
   userId?: string;       // Platform-specific user identifier (optional for group chats)
   displayName?: string;  // Human-readable name for audit logs
+  chatType?: 'private' | 'group' | 'unknown';
 }
 
 /** Composite key for routing: channelType + chatId */
@@ -105,6 +106,7 @@ export interface ChannelBinding {
   id: string;
   channelType: ChannelType;
   chatId: string;
+  ownerKey?: string;
   /** CodePilot session ID this chat is bound to */
   codepilotSessionId: string;
   /** SDK session ID for resume (cached from last conversation) */
@@ -115,8 +117,20 @@ export interface ChannelBinding {
   model: string;
   /** Chat mode */
   mode: 'code' | 'plan' | 'ask';
+  generation?: number;
   /** Whether this binding is currently active */
   active: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Persistent owner scope for one Feishu/Lark conversation. */
+export interface BridgeOwner {
+  ownerKey: string;
+  channelType: 'feishu';
+  chatId: string;
+  chatType: 'private' | 'group' | 'unknown';
+  displayName?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -159,7 +173,14 @@ export interface PermissionLink {
   channelType: ChannelType;
   chatId: string;
   messageId: string;
+  sessionId?: string;
+  toolName?: string;
+  toolInput?: string;
+  suggestions?: string;
+  resolved?: boolean;
   createdAt: string;
+  resolvedAt?: string;
+  expiresAt?: string;
 }
 
 // ── Streaming Preview ─────────────────────────────────────────

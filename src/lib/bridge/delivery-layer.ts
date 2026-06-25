@@ -25,6 +25,16 @@ const INTER_CHUNK_DELAY_MS = 300;
 /** Shared rate limiter instance (20 messages/minute per chat). */
 const rateLimiter = new ChatRateLimiter();
 
+type DeliveryOptions = {
+  sessionId?: string;
+  dedupKey?: string;
+  shouldContinue?: () => boolean;
+};
+
+function cancelled(): SendResult {
+  return { ok: false, error: 'Delivery cancelled' };
+}
+
 // Periodically clean up idle rate limiter buckets (every 5 minutes).
 // unref() so the timer doesn't prevent Node.js process exit (e.g. in tests).
 setInterval(() => { rateLimiter.cleanup(); }, 5 * 60_000).unref();
@@ -137,10 +147,7 @@ function retryDelay(result: SendResult, attempt: number): number {
 export async function deliver(
   adapter: BaseChannelAdapter,
   message: OutboundMessage,
-  opts?: {
-    sessionId?: string;
-    dedupKey?: string;
-  },
+  opts?: DeliveryOptions,
 ): Promise<SendResult> {
   const { store } = getBridgeContext();
 
@@ -172,12 +179,15 @@ export async function deliver(
   let lastMessageId: string | undefined;
 
   for (let i = 0; i < chunks.length; i++) {
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     // Rate limit: wait if this chat is sending too fast
     await rateLimiter.acquire(message.address.chatId);
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
 
     // Inter-chunk delay to avoid hitting rate limits on multi-chunk messages
     if (i > 0) {
       await new Promise(r => setTimeout(r, INTER_CHUNK_DELAY_MS));
+      if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     }
 
     const chunkMessage: OutboundMessage = {
@@ -189,7 +199,8 @@ export async function deliver(
       replyToMessageId: message.replyToMessageId,
     };
 
-    const result = await sendWithRetry(adapter, chunkMessage);
+    const result = await sendWithRetry(adapter, chunkMessage, undefined, opts?.shouldContinue);
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     if (!result.ok) {
       return result;
     }
@@ -235,11 +246,14 @@ async function sendWithRetry(
   adapter: BaseChannelAdapter,
   message: OutboundMessage,
   plainFallback?: string,
+  shouldContinue?: () => boolean,
 ): Promise<SendResult> {
   let lastError: string | undefined;
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+    if (shouldContinue && !shouldContinue()) return cancelled();
     const result = await adapter.send(message);
+    if (shouldContinue && !shouldContinue()) return cancelled();
     if (result.ok) return result;
 
     lastError = result.error;
@@ -248,11 +262,13 @@ async function sendWithRetry(
     // HTML parse error: immediately fallback to plain text (no retry needed)
     if (category === 'parse_error' && message.parseMode === 'HTML') {
       const fallbackText = plainFallback || message.text;
+      if (shouldContinue && !shouldContinue()) return cancelled();
       const plainResult = await adapter.send({
         ...message,
         text: fallbackText,
         parseMode: 'plain',
       });
+      if (shouldContinue && !shouldContinue()) return cancelled();
       if (plainResult.ok) return plainResult;
       lastError = plainResult.error;
       // If plain text also fails, classify that error and continue
@@ -270,6 +286,7 @@ async function sendWithRetry(
     // Wait before next retry — honor retry_after for 429
     if (attempt < MAX_RETRIES - 1) {
       await new Promise(r => setTimeout(r, retryDelay(result, attempt)));
+      if (shouldContinue && !shouldContinue()) return cancelled();
     }
   }
 
@@ -284,7 +301,7 @@ export async function deliverRendered(
   adapter: BaseChannelAdapter,
   address: ChannelAddress,
   chunks: TelegramChunk[],
-  opts?: { sessionId?: string; dedupKey?: string; replyToMessageId?: string },
+  opts?: DeliveryOptions & { replyToMessageId?: string },
 ): Promise<SendResult> {
   const { store } = getBridgeContext();
 
@@ -302,9 +319,12 @@ export async function deliverRendered(
   let failedCount = 0;
 
   for (let i = 0; i < chunks.length; i++) {
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     await rateLimiter.acquire(address.chatId);
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     if (i > 0) {
       await new Promise(r => setTimeout(r, INTER_CHUNK_DELAY_MS));
+      if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     }
 
     const chunk = chunks[i];
@@ -316,7 +336,8 @@ export async function deliverRendered(
     };
 
     // Try HTML first, fall back to plain text on parse error
-    const result = await sendWithRetry(adapter, htmlMessage, chunk.text);
+    const result = await sendWithRetry(adapter, htmlMessage, chunk.text, opts?.shouldContinue);
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     if (!result.ok) {
       console.warn(
         `[delivery-layer] Chunk ${i + 1}/${chunks.length} failed for chat ${address.chatId}: ${result.error}`,
@@ -342,8 +363,10 @@ export async function deliverRendered(
 
   // Notify user about incomplete delivery
   if (failedCount > 0 && lastMessageId) {
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
     const notice = `[${failedCount}/${chunks.length} part(s) failed to send — response may be incomplete]`;
     await adapter.send({ address, text: notice, parseMode: 'plain' }).catch(() => {});
+    if (opts?.shouldContinue && !opts.shouldContinue()) return cancelled();
   }
 
   if (opts?.dedupKey) {

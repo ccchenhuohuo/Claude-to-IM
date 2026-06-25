@@ -1,7 +1,7 @@
 {
   "name": "claude-to-im",
   "version": "0.1.0",
-  "description": "Host-agnostic bridge connecting Claude Code SDK to IM platforms (Telegram, Discord, Feishu)",
+  "description": "Feishu/Lark bridge connecting Claude Code SDK to IM conversations",
   "type": "module",
   "main": "dist/lib/bridge/context.js",
   "types": "dist/lib/bridge/context.d.ts",
@@ -9,6 +9,42 @@
     ".": {
       "types": "./dist/lib/bridge/context.d.ts",
       "import": "./dist/lib/bridge/context.js"
+    },
+    "./context": {
+      "types": "./dist/lib/bridge/context.d.ts",
+      "import": "./dist/lib/bridge/context.js"
+    },
+    "./host": {
+      "types": "./dist/lib/bridge/host.d.ts",
+      "import": "./dist/lib/bridge/host.js"
+    },
+    "./types": {
+      "types": "./dist/lib/bridge/types.d.ts",
+      "import": "./dist/lib/bridge/types.js"
+    },
+    "./bridge-manager": {
+      "types": "./dist/lib/bridge/bridge-manager.d.ts",
+      "import": "./dist/lib/bridge/bridge-manager.js"
+    },
+    "./channel-router": {
+      "types": "./dist/lib/bridge/channel-router.d.ts",
+      "import": "./dist/lib/bridge/channel-router.js"
+    },
+    "./channel-adapter": {
+      "types": "./dist/lib/bridge/channel-adapter.d.ts",
+      "import": "./dist/lib/bridge/channel-adapter.js"
+    },
+    "./permission-broker": {
+      "types": "./dist/lib/bridge/permission-broker.d.ts",
+      "import": "./dist/lib/bridge/permission-broker.js"
+    },
+    "./adapters": {
+      "types": "./dist/lib/bridge/adapters/index.d.ts",
+      "import": "./dist/lib/bridge/adapters/index.js"
+    },
+    "./adapters/feishu": {
+      "types": "./dist/lib/bridge/adapters/feishu-adapter.d.ts",
+      "import": "./dist/lib/bridge/adapters/feishu-adapter.js"
     },
     "./src/lib/bridge/*.js": {
       "types": "./dist/lib/bridge/*.d.ts",
@@ -33,6 +69,8 @@
     "prepare": "npm run build",
     "typecheck": "tsc --noEmit",
     "test:unit": "node --test --import tsx --test-timeout=15000 src/__tests__/unit/bridge-*.test.ts",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-lines=45 --test-coverage-functions=40 --test-coverage-branches=35 --import tsx --test-timeout=15000 src/__tests__/unit/bridge-*.test.ts",
+    "smoke:pack": "npm run build && node scripts/pack-smoke.mjs",
     "test": "npm run typecheck && npm run test:unit",
     "example": "npx tsx src/lib/bridge/examples/mock-host.ts"
   },

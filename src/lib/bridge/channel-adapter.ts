@@ -115,7 +115,12 @@ export abstract class BaseChannelAdapter {
    * (close streaming mode, add footer, etc.).
    * Returns true if a card was finalized (caller should skip normal delivery).
    */
-  onStreamEnd?(_chatId: string, _status: 'completed' | 'interrupted' | 'error', _responseText: string): Promise<boolean>;
+  onStreamEnd?(
+    _chatId: string,
+    _status: 'completed' | 'interrupted' | 'error',
+    _responseText: string,
+    _options?: { shouldContinue?: () => boolean },
+  ): Promise<boolean>;
 }
 
 // ── Adapter Registry ────────────────────────────────────────────

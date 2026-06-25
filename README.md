@@ -2,7 +2,7 @@
 
 English | [中文](README.zh-CN.md)
 
-Claude-to-IM is a host-agnostic bridge library that connects [Claude Code SDK](https://docs.anthropic.com/en/docs/claude-code/sdk) to IM platforms, allowing users to interact with Claude through Telegram, Discord, and Feishu (Lark).
+Claude-to-IM is a host-agnostic bridge library that connects [Claude Code SDK](https://docs.anthropic.com/en/docs/claude-code/sdk) to Feishu/Lark, allowing users to interact with Claude from a Feishu chat.
 
 This library handles all IM-side complexity — message routing, streaming previews, permission approval flows, Markdown rendering, chunking, retry, rate limiting — while delegating persistence, LLM calls, and permission resolution to the host application through a set of dependency injection interfaces.
 
@@ -14,19 +14,19 @@ Claude-to-IM was extracted from CodePilot as a standalone library for developers
 
 ## Features
 
-- **Multi-platform adapters**: Telegram (long polling), Discord (Gateway WebSocket), Feishu/Lark (WSClient)
-- **Streaming previews**: Real-time response drafts via message editing, with per-platform throttling
+- **Feishu/Lark adapter**: Long-connection WSClient integration with Feishu rich text/cards
+- **Streaming previews**: Real-time response drafts via Feishu cards
 - **Permission management**: Interactive inline buttons for Claude Code tool approvals (allow / deny / allow for session)
 - **Session binding**: Each IM chat maps to a persistent conversation session with working directory and model settings
-- **Markdown rendering**: Platform-native formatting — HTML for Telegram, Discord-flavored Markdown, Feishu rich text cards
-- **Reliable delivery**: Auto-chunking at platform limits, retry with exponential backoff, HTML fallback on parse errors, message deduplication
+- **Markdown rendering**: Feishu rich text/card rendering for Claude responses
+- **Reliable delivery**: Auto-chunking at Feishu limits, retry with exponential backoff, message deduplication
 - **Security**: Input validation, token bucket rate limiting (20 msg/min per chat), user authorization whitelists, full audit logging
 - **Host-agnostic**: All host dependencies abstracted via 4 DI interfaces — no database driver, no LLM client, no framework lock-in
 
 ## Architecture
 
 ```
-IM Platform (Telegram / Discord / Feishu)
+Feishu / Lark
         |
         | InboundMessage
         v
@@ -88,7 +88,7 @@ import * as bridgeManager from 'claude-to-im/bridge-manager';
 await bridgeManager.start();
 
 const status = bridgeManager.getStatus();
-// { running: true, adapters: [{ channelType: 'telegram', running: true, ... }] }
+// { running: true, adapters: [{ channelType: 'feishu', running: true, ... }] }
 ```
 
 ### 4. Run the Example
@@ -108,20 +108,21 @@ All settings are read through `BridgeStore.getSetting(key)`. Your host applicati
 | Key | Description |
 |-----|-------------|
 | `remote_bridge_enabled` | Master switch — `"true"` to enable the bridge |
-| `bridge_{adapter}_bot_token` | Bot token for the platform (e.g. `bridge_telegram_bot_token`) |
-| `bridge_{adapter}_allowed_users` | Comma-separated user IDs authorized to use the bridge |
+| `bridge_feishu_app_id` | Feishu/Lark app ID |
+| `bridge_feishu_app_secret` | Feishu/Lark app secret |
+| `bridge_feishu_allowed_users` | Comma-separated user IDs authorized to use the bridge |
 
 ### Optional Settings
 
 | Key | Description | Default |
 |-----|-------------|---------|
 | `bridge_auto_start` | Auto-start bridge on app launch | `"false"` |
-| `bridge_{adapter}_enabled` | Per-adapter toggle | `"false"` |
-| `bridge_{adapter}_stream_enabled` | Enable streaming previews | `"true"` |
+| `bridge_feishu_enabled` | Feishu adapter toggle | `"false"` |
+| `bridge_feishu_stream_enabled` | Enable streaming previews | `"true"` |
 | `bridge_default_cwd` | Default working directory for new sessions | `$HOME` |
 | `bridge_model` | Default Claude model | Host decides |
 
-Replace `{adapter}` with `telegram`, `discord`, or `feishu`.
+This build registers only the Feishu/Lark adapter at runtime.
 
 ## Limitations
 
@@ -148,12 +149,9 @@ The bridge does not bundle any database driver. You provide all persistence thro
 
 The bridge uses a session lock mechanism (`acquireSessionLock` / `renewSessionLock` / `releaseSessionLock`) to serialize messages within the same session. Your `BridgeStore` implementation must provide atomic lock operations. For single-process deployments, in-memory locks work fine. For multi-process deployments, you need distributed locking (e.g., database-backed).
 
-### Platform Bot Setup
+### Feishu/Lark App Setup
 
-You still need to create bots on each platform and obtain tokens:
-- **Telegram**: Create a bot via [@BotFather](https://t.me/BotFather)
-- **Discord**: Create an application in the [Developer Portal](https://discord.com/developers/applications) with Message Content Intent enabled
-- **Feishu**: Create an app in the [Developer Console](https://open.feishu.cn/app) with IM permissions
+You still need to create a Feishu/Lark app in the [Developer Console](https://open.feishu.cn/app), enable bot capability, subscribe to `im.message.receive_v1` over long connection, grant IM permissions, and publish the app.
 
 ## Documentation
 
@@ -180,17 +178,10 @@ src/
     delivery-layer.ts       # Reliable outbound delivery (chunk, retry, dedup, audit)
     permission-broker.ts    # Tool permission forwarding and callback handling
     adapters/
-      telegram-adapter.ts   # Telegram Bot API long polling
-      discord-adapter.ts    # Discord.js Gateway WebSocket
       feishu-adapter.ts     # Feishu/Lark WSClient
-      telegram-media.ts     # Telegram file download/attachment handling
-      telegram-utils.ts     # Telegram API helpers
-      index.ts              # Side-effect imports for adapter self-registration
+      index.ts              # Feishu-only runtime adapter catalog
     markdown/
       ir.ts                 # Intermediate representation for Markdown AST
-      render.ts             # Generic IR -> platform string renderer
-      telegram.ts           # Markdown -> Telegram HTML
-      discord.ts            # Markdown -> Discord-flavored Markdown
       feishu.ts             # Markdown -> Feishu rich text / cards
     security/
       validators.ts         # Input validation (path traversal, injection, sanitization)

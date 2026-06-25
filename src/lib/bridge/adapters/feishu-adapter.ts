@@ -552,6 +552,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     chatId: string,
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
+    shouldContinue?: () => boolean,
   ): Promise<boolean> {
     // Wait for in-flight card creation to complete before finalizing
     const pending = this.cardCreatePromises.get(chatId);
@@ -561,6 +562,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return false;
+    if (shouldContinue && !shouldContinue()) {
+      this.cleanupCard(chatId);
+      return false;
+    }
 
     // Clear any pending throttle timer
     if (state.throttleTimer) {
@@ -570,6 +575,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     try {
       // Step 1: Close streaming mode
+      if (shouldContinue && !shouldContinue()) return false;
       state.sequence++;
       await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
         path: { card_id: state.cardId },
@@ -577,6 +583,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       });
 
       // Step 2: Build and apply final card
+      if (shouldContinue && !shouldContinue()) return false;
       const statusLabels: Record<string, string> = {
         completed: '✅ Completed',
         interrupted: '⚠️ Interrupted',
@@ -648,8 +655,13 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.updateToolProgress(chatId, tools);
   }
 
-  async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
-    return this.finalizeCard(chatId, status, responseText);
+  async onStreamEnd(
+    chatId: string,
+    status: 'completed' | 'interrupted' | 'error',
+    responseText: string,
+    options?: { shouldContinue?: () => boolean },
+  ): Promise<boolean> {
+    return this.finalizeCard(chatId, status, responseText, options?.shouldContinue);
   }
 
   // ── Send ────────────────────────────────────────────────────

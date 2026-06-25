@@ -21,6 +21,7 @@ import { escapeHtml } from './adapters/telegram-utils.js';
  * Key: permissionRequestId, value: timestamp. Entries expire after 30s.
  */
 const recentPermissionForwards = new Map<string, number>();
+const PERMISSION_LINK_TTL_MS = 5 * 60_000;
 
 /**
  * Forward a permission request to an IM channel as an interactive message.
@@ -35,7 +36,7 @@ export async function forwardPermissionRequest(
   suggestions?: unknown[],
   replyToMessageId?: string,
 ): Promise<void> {
-  const { store } = getBridgeContext();
+  const { store, permissions } = getBridgeContext();
 
   // Dedup: prevent duplicate forwarding of the same permission request
   const now = Date.now();
@@ -59,77 +60,96 @@ export async function forwardPermissionRequest(
 
   let result: import('./types.js').SendResult;
 
-  if (adapter.channelType === 'qq' || adapter.channelType === 'weixin') {
-    const channelLabel = adapter.channelType === 'weixin' ? 'WeChat' : 'QQ';
-    // QQ / WeChat: plain text permission prompt with copyable /perm commands (no inline buttons)
-    const plainText = [
-      `Permission Required`,
-      ``,
-      `Tool: ${toolName}`,
-      truncatedInput,
-      ``,
-      `Reply:`,
-      `1 - Allow once`,
-      `2 - Allow session`,
-      `3 - Deny`,
-      ``,
-      `Or use full command:`,
-      `/perm allow ${permissionRequestId}`,
-      `/perm allow_session ${permissionRequestId}`,
-      `/perm deny ${permissionRequestId}`,
-    ].join('\n');
+  try {
+    if (adapter.channelType === 'qq' || adapter.channelType === 'weixin') {
+      const channelLabel = adapter.channelType === 'weixin' ? 'WeChat' : 'QQ';
+      // QQ / WeChat: plain text permission prompt with copyable /perm commands (no inline buttons)
+      const plainText = [
+        `Permission Required`,
+        ``,
+        `Tool: ${toolName}`,
+        truncatedInput,
+        ``,
+        `Reply:`,
+        `1 - Allow once`,
+        `2 - Allow session`,
+        `3 - Deny`,
+        ``,
+        `Or use full command:`,
+        `/perm allow ${permissionRequestId}`,
+        `/perm allow_session ${permissionRequestId}`,
+        `/perm deny ${permissionRequestId}`,
+      ].join('\n');
 
-    const plainMessage: OutboundMessage = {
-      address,
-      text: plainText,
-      parseMode: 'plain',
-      replyToMessageId,
-    };
+      const plainMessage: OutboundMessage = {
+        address,
+        text: plainText,
+        parseMode: 'plain',
+        replyToMessageId,
+      };
 
-    result = await deliver(adapter, plainMessage, { sessionId });
-    console.log(
-      `[permission-broker] Sent plain-text permission prompt for ${channelLabel}: ${permissionRequestId}`,
-    );
-  } else {
-    const text = [
-      `<b>Permission Required</b>`,
-      ``,
-      `Tool: <code>${escapeHtml(toolName)}</code>`,
-      `<pre>${escapeHtml(truncatedInput)}</pre>`,
-      ``,
-      `Choose an action:`,
-    ].join('\n');
+      result = await deliver(adapter, plainMessage, { sessionId });
+      console.log(
+        `[permission-broker] Sent plain-text permission prompt for ${channelLabel}: ${permissionRequestId}`,
+      );
+    } else {
+      const text = [
+        `<b>Permission Required</b>`,
+        ``,
+        `Tool: <code>${escapeHtml(toolName)}</code>`,
+        `<pre>${escapeHtml(truncatedInput)}</pre>`,
+        ``,
+        `Choose an action:`,
+      ].join('\n');
 
-    const message: OutboundMessage = {
-      address,
-      text,
-      parseMode: 'HTML',
-      inlineButtons: [
-        [
-          { text: 'Allow', callbackData: `perm:allow:${permissionRequestId}` },
-          { text: 'Allow Session', callbackData: `perm:allow_session:${permissionRequestId}` },
-          { text: 'Deny', callbackData: `perm:deny:${permissionRequestId}` },
+      const message: OutboundMessage = {
+        address,
+        text,
+        parseMode: 'HTML',
+        inlineButtons: [
+          [
+            { text: 'Allow', callbackData: `perm:allow:${permissionRequestId}` },
+            { text: 'Allow Session', callbackData: `perm:allow_session:${permissionRequestId}` },
+            { text: 'Deny', callbackData: `perm:deny:${permissionRequestId}` },
+          ],
         ],
-      ],
-      replyToMessageId,
-    };
+        replyToMessageId,
+      };
 
-    result = await deliver(adapter, message, { sessionId });
+      result = await deliver(adapter, message, { sessionId });
+    }
+  } catch (err) {
+    console.error(`[permission-broker] Failed to deliver permission prompt ${permissionRequestId}:`, err);
+    permissions.resolvePendingPermission(permissionRequestId, {
+      behavior: 'deny',
+      message: 'Permission prompt delivery failed',
+    });
+    return;
+  }
+
+  if (!result.ok) {
+    console.warn(`[permission-broker] Permission prompt delivery failed for ${permissionRequestId}`);
+    permissions.resolvePendingPermission(permissionRequestId, {
+      behavior: 'deny',
+      message: 'Permission prompt delivery failed',
+    });
+    return;
   }
 
   // Record the link so we can match callback queries back to this permission
-  if (result.ok && result.messageId) {
-    try {
-      store.insertPermissionLink({
-        permissionRequestId,
-        channelType: adapter.channelType,
-        chatId: address.chatId,
-        messageId: result.messageId,
-        toolName,
-        suggestions: suggestions ? JSON.stringify(suggestions) : '',
-      });
-    } catch { /* best effort */ }
-  }
+  try {
+    store.insertPermissionLink({
+      permissionRequestId,
+      channelType: adapter.channelType,
+      chatId: address.chatId,
+      messageId: result.messageId || '',
+      sessionId,
+      toolName,
+      toolInput: inputStr,
+      suggestions: suggestions ? JSON.stringify(suggestions) : '',
+      expiresAt: new Date(Date.now() + PERMISSION_LINK_TTL_MS).toISOString(),
+    });
+  } catch { /* best effort */ }
 }
 
 /**
@@ -145,6 +165,7 @@ export function handlePermissionCallback(
   callbackData: string,
   callbackChatId: string,
   callbackMessageId?: string,
+  callbackChannelType?: string,
 ): boolean {
   const { store, permissions } = getBridgeContext();
 
@@ -154,6 +175,9 @@ export function handlePermissionCallback(
 
   const action = parts[1];
   const permissionRequestId = parts.slice(2).join(':'); // permId might contain colons
+  if (!['allow', 'allow_session', 'deny'].includes(action)) {
+    return false;
+  }
 
   // Look up the permission link to validate origin and check dedup
   const link = store.getPermissionLink(permissionRequestId);
@@ -168,6 +192,11 @@ export function handlePermissionCallback(
     return false;
   }
 
+  if (callbackChannelType && link.channelType && link.channelType !== callbackChannelType) {
+    console.warn(`[permission-broker] Channel mismatch: expected ${link.channelType}, got ${callbackChannelType}`);
+    return false;
+  }
+
   // Security: verify the callback came from the original permission message
   if (callbackMessageId && link.messageId !== callbackMessageId) {
     console.warn(`[permission-broker] Message ID mismatch: expected ${link.messageId}, got ${callbackMessageId}`);
@@ -177,6 +206,12 @@ export function handlePermissionCallback(
   // Dedup: reject if already resolved (fast path before expensive resolution)
   if (link.resolved) {
     console.warn(`[permission-broker] Permission ${permissionRequestId} already resolved`);
+    return false;
+  }
+
+  if (link.expiresAt && Date.parse(link.expiresAt) <= Date.now()) {
+    console.warn(`[permission-broker] Permission ${permissionRequestId} expired`);
+    try { store.markPermissionLinkResolved(permissionRequestId); } catch { /* best effort */ }
     return false;
   }
 
@@ -209,7 +244,8 @@ export function handlePermissionCallback(
       let updatedPermissions: PermissionUpdate[] | undefined;
       if (link.suggestions) {
         try {
-          updatedPermissions = JSON.parse(link.suggestions) as PermissionUpdate[];
+          const parsed = JSON.parse(link.suggestions);
+          updatedPermissions = Array.isArray(parsed) ? parsed as PermissionUpdate[] : undefined;
         } catch { /* fall through without updatedPermissions */ }
       }
 

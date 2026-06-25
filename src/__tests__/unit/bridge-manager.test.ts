@@ -135,6 +135,120 @@ describe('bridge-manager lifecycle', () => {
   });
 });
 
+describe('bridge-manager permission shortcut dispatch', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('does not treat another channel with the same chat id as a numeric permission shortcut', async () => {
+    const store = createMinimalStore();
+    const seenChannels: Array<string | undefined> = [];
+    store.listPendingPermissionLinksByChat = (_chatId: string, channelType?: string) => {
+      seenChannels.push(channelType);
+      return channelType === 'qq'
+        ? [{
+            permissionRequestId: 'perm-qq',
+            channelType: 'qq',
+            chatId: 'same-chat',
+            messageId: 'msg-qq',
+            resolved: false,
+            suggestions: '[]',
+          }]
+        : [];
+    };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+
+    assert.equal(_testOnly.isNumericPermissionShortcut('feishu', '1', 'same-chat'), false);
+    assert.deepEqual(seenChannels, ['feishu']);
+  });
+});
+
+describe('bridge-manager mode command', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('persists mode on the owner session and updates binding generation', async () => {
+    const store = createMinimalStore();
+    const session: any = {
+      id: 'session-mode',
+      ownerKey: 'owner-mode',
+      working_directory: '/tmp/lark/owner-mode',
+      model: 'claude',
+      mode: 'code',
+      generation: 1,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const binding: any = {
+      id: 'binding-mode',
+      channelType: 'feishu',
+      chatId: 'chat-mode',
+      ownerKey: 'owner-mode',
+      codepilotSessionId: 'session-mode',
+      sdkSessionId: '',
+      workingDirectory: '/tmp/lark/owner-mode',
+      model: 'claude',
+      mode: 'code',
+      generation: 1,
+      active: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    let updateBindingArgs: any = null;
+    let updateSessionModeArgs: [string, 'code' | 'plan' | 'ask'] | null = null;
+    store.getOrCreateOwner = () => ({ ownerKey: 'owner-mode', channelType: 'feishu', chatId: 'chat-mode', chatType: 'group' } as any);
+    store.getOwnerWorkspace = () => '/tmp/lark/owner-mode';
+    store.getChannelBinding = () => binding;
+    store.getSession = () => session;
+    store.updateSessionMode = (sessionId, mode) => {
+      updateSessionModeArgs = [sessionId, mode];
+      session.mode = mode;
+    };
+    store.bumpSessionGeneration = () => {
+      session.generation += 1;
+      return session.generation;
+    };
+    store.updateChannelBinding = (_id, updates) => {
+      updateBindingArgs = updates;
+      Object.assign(binding, updates);
+    };
+    initBridgeContext({
+      store,
+      llm: { streamChat: () => new ReadableStream() },
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sent: OutboundMessage[] = [];
+    const adapter = createMinimalAdapter('feishu', sent);
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'mode-1',
+      address: { channelType: 'feishu', chatId: 'chat-mode', userId: 'user-a' },
+      text: '/mode plan',
+      timestamp: Date.now(),
+      isGroup: true,
+      triggerReason: 'mention',
+    });
+
+    assert.deepEqual(updateSessionModeArgs, ['session-mode', 'plan']);
+    assert.deepEqual(updateBindingArgs, { mode: 'plan', generation: 2 });
+    assert.equal(binding.mode, 'plan');
+    assert.match(sent[0]?.text || '', /Mode set to/);
+  });
+});
+
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {
   return {
     getSetting: (key: string) => settings[key] ?? null,
@@ -343,7 +457,7 @@ describe('bridge-manager feishu ambient group context', () => {
     await _testOnly.handleMessage(adapter, {
       messageId: 'ctx-sanitize-1',
       address: { channelType: 'feishu', chatId: 'group-sanitize', userId: 'user-a' },
-      text: 'abc defghijkl',
+      text: 'abc\0defghijkl',
       timestamp: baseTime,
       contextOnly: true,
       isGroup: true,
@@ -364,7 +478,7 @@ describe('bridge-manager feishu ambient group context', () => {
 
     assert.equal(prompts.length, 1);
     assert.ok(prompts[0].includes('abcdefgh'));
-    assert.equal(prompts[0].includes(' '), false);
+    assert.equal(prompts[0].includes('\0'), false);
     assert.equal(prompts[0].includes('ijkl'), false);
   });
 
@@ -450,6 +564,311 @@ describe('bridge-manager feishu ambient group context', () => {
     }
 
     assert.equal(_testOnly.getGroupContextBufferSize(), 2);
+  });
+});
+
+describe('bridge-manager stale binding protection', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('drops an in-flight response when the chat is rebound before the stream finishes', async () => {
+    const audits: string[] = [];
+    let updateBindingCalls = 0;
+    let updateSdkCalls = 0;
+    const sessions = new Map([
+      ['session-old', { id: 'session-old', working_directory: '/tmp/old', model: 'claude' }],
+      ['session-new', { id: 'session-new', working_directory: '/tmp/new', model: 'claude' }],
+    ]);
+    let binding: any = {
+      id: 'binding-1',
+      channelType: 'feishu',
+      chatId: 'chat-stale',
+      ownerKey: 'owner-1',
+      codepilotSessionId: 'session-old',
+      sdkSessionId: '',
+      workingDirectory: '/tmp/old',
+      model: 'claude',
+      mode: 'code',
+      generation: 1,
+      active: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const store = createMinimalStore();
+    store.getChannelBinding = () => binding;
+    store.getSession = (id: string) => sessions.get(id) as any ?? null;
+    store.getMessages = () => ({ messages: [] });
+    store.insertAuditLog = (entry) => { audits.push(entry.summary); };
+    store.updateChannelBinding = () => { updateBindingCalls += 1; };
+    store.updateSdkSessionId = () => { updateSdkCalls += 1; };
+
+    const llm: LLMProvider = {
+      streamChat: () => {
+        binding = {
+          ...binding,
+          codepilotSessionId: 'session-new',
+          workingDirectory: '/tmp/new',
+          generation: 1,
+        };
+        return new ReadableStream({
+          start(controller) {
+            controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'old answer' })}\n`);
+            controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: JSON.stringify({ is_error: false, session_id: 'sdk-old' }) })}\n`);
+            controller.close();
+          },
+        });
+      },
+    };
+    initBridgeContext({
+      store,
+      llm,
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sent: OutboundMessage[] = [];
+    const adapter = createMinimalAdapter('feishu', sent);
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-stale',
+      address: { channelType: 'feishu', chatId: 'chat-stale', userId: 'user-a' },
+      text: 'start long task',
+      timestamp: Date.now(),
+      isGroup: true,
+      triggerReason: 'mention',
+    });
+
+    assert.equal(sent.length, 0);
+    assert.equal(updateBindingCalls, 0);
+    assert.equal(updateSdkCalls, 0);
+    assert.ok(audits.some((summary) => summary.includes('[STALE_BINDING] Dropped response')));
+  });
+
+  it('drops sdkSessionId writeback when the chat is rebound during card finalization', async () => {
+    const audits: string[] = [];
+    let updateBindingCalls = 0;
+    let updateSdkCalls = 0;
+    let binding: any = {
+      id: 'binding-1',
+      channelType: 'feishu',
+      chatId: 'chat-card-stale',
+      ownerKey: 'owner-1',
+      codepilotSessionId: 'session-old',
+      sdkSessionId: '',
+      workingDirectory: '/tmp/old',
+      model: 'claude',
+      mode: 'code',
+      generation: 1,
+      active: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const store = createMinimalStore();
+    store.getChannelBinding = () => binding;
+    store.getSession = () => ({ id: 'session-old', working_directory: '/tmp/old', model: 'claude' } as any);
+    store.getMessages = () => ({ messages: [] });
+    store.insertAuditLog = (entry) => { audits.push(entry.summary); };
+    store.updateChannelBinding = () => { updateBindingCalls += 1; };
+    store.updateSdkSessionId = () => { updateSdkCalls += 1; };
+
+    const llm: LLMProvider = {
+      streamChat: () => new ReadableStream({
+        start(controller) {
+          controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'old answer' })}\n`);
+          controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: JSON.stringify({ is_error: false, session_id: 'sdk-old' }) })}\n`);
+          controller.close();
+        },
+      }),
+    };
+    initBridgeContext({
+      store,
+      llm,
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sent: OutboundMessage[] = [];
+    let streamEndCalls = 0;
+    const adapter = Object.assign(createMinimalAdapter('feishu', sent), {
+      onStreamText: () => {},
+      onStreamEnd: async () => {
+        streamEndCalls += 1;
+        binding = {
+          ...binding,
+          codepilotSessionId: 'session-new',
+          workingDirectory: '/tmp/new',
+          generation: 1,
+        };
+        return true;
+      },
+    }) as unknown as BaseChannelAdapter;
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-card-stale',
+      address: { channelType: 'feishu', chatId: 'chat-card-stale', userId: 'user-a' },
+      text: 'start long task',
+      timestamp: Date.now(),
+      isGroup: true,
+      triggerReason: 'mention',
+    });
+
+    assert.equal(streamEndCalls, 1);
+    assert.equal(sent.length, 0);
+    assert.equal(updateBindingCalls, 0);
+    assert.equal(updateSdkCalls, 0);
+    assert.ok(audits.some((summary) => summary.includes('[STALE_BINDING] Dropped response')));
+  });
+
+  it('passes stale guard into Feishu card finalization before visible final update', async () => {
+    const audits: string[] = [];
+    let finalized = false;
+    let binding: any = {
+      id: 'binding-guard',
+      channelType: 'feishu',
+      chatId: 'chat-card-guard',
+      ownerKey: 'owner-1',
+      codepilotSessionId: 'session-old',
+      sdkSessionId: '',
+      workingDirectory: '/tmp/old',
+      model: 'claude',
+      mode: 'code',
+      generation: 1,
+      active: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const store = createMinimalStore();
+    store.getChannelBinding = () => binding;
+    store.getSession = () => ({ id: 'session-old', working_directory: '/tmp/old', model: 'claude' } as any);
+    store.getMessages = () => ({ messages: [] });
+    store.insertAuditLog = (entry) => { audits.push(entry.summary); };
+
+    const llm: LLMProvider = {
+      streamChat: () => new ReadableStream({
+        start(controller) {
+          controller.enqueue(`data: ${JSON.stringify({ type: 'text', data: 'old answer' })}\n`);
+          controller.enqueue(`data: ${JSON.stringify({ type: 'result', data: JSON.stringify({ is_error: false, session_id: 'sdk-old' }) })}\n`);
+          controller.close();
+        },
+      }),
+    };
+    initBridgeContext({
+      store,
+      llm,
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sent: OutboundMessage[] = [];
+    const adapter = Object.assign(createMinimalAdapter('feishu', sent), {
+      onStreamText: () => {},
+      onStreamEnd: async (_chatId: string, status: 'completed' | 'interrupted' | 'error', _text: string, options?: { shouldContinue?: () => boolean }) => {
+        if (status === 'completed') {
+          binding = {
+            ...binding,
+            codepilotSessionId: 'session-new',
+            workingDirectory: '/tmp/new',
+            generation: 2,
+          };
+          if (options?.shouldContinue && !options.shouldContinue()) return false;
+          finalized = true;
+        }
+        return true;
+      },
+    }) as unknown as BaseChannelAdapter;
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-card-guard',
+      address: { channelType: 'feishu', chatId: 'chat-card-guard', userId: 'user-a' },
+      text: 'start long task',
+      timestamp: Date.now(),
+      isGroup: true,
+      triggerReason: 'mention',
+    });
+
+    assert.equal(finalized, false);
+    assert.equal(sent.length, 0);
+    assert.ok(audits.some((summary) => summary.includes('[STALE_BINDING] Dropped response')));
+  });
+
+  it('does not abort the active task when /bind rejects a missing session', async () => {
+    let streamController!: ReadableStreamDefaultController<string>;
+    let streamStartedResolve!: () => void;
+    const streamStarted = new Promise<void>((resolve) => { streamStartedResolve = resolve; });
+    let capturedAbortController: AbortController | undefined;
+    const binding: any = {
+      id: 'binding-bind',
+      channelType: 'feishu',
+      chatId: 'chat-bind',
+      codepilotSessionId: 'session-current',
+      sdkSessionId: '',
+      workingDirectory: '/tmp/current',
+      model: 'claude',
+      mode: 'code',
+      generation: 1,
+      active: true,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    const store = createMinimalStore();
+    store.getChannelBinding = () => binding;
+    store.getSession = (id: string) => id === 'session-current'
+      ? ({ id: 'session-current', working_directory: '/tmp/current', model: 'claude' } as any)
+      : null;
+    store.getMessages = () => ({ messages: [] });
+
+    const llm: LLMProvider = {
+      streamChat: (params) => {
+        capturedAbortController = params.abortController;
+        return new ReadableStream({
+          start(controller) {
+            streamController = controller;
+            streamStartedResolve();
+          },
+        });
+      },
+    };
+    initBridgeContext({
+      store,
+      llm,
+      permissions: { resolvePendingPermission: () => false },
+      lifecycle: {},
+    });
+
+    const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+    const sent: OutboundMessage[] = [];
+    const adapter = createMinimalAdapter('feishu', sent);
+
+    const activeTask = _testOnly.handleMessage(adapter, {
+      messageId: 'msg-active',
+      address: { channelType: 'feishu', chatId: 'chat-bind', userId: 'user-a' },
+      text: 'keep running',
+      timestamp: Date.now(),
+      isGroup: true,
+      triggerReason: 'mention',
+    });
+    await streamStarted;
+
+    await _testOnly.handleMessage(adapter, {
+      messageId: 'msg-bind',
+      address: { channelType: 'feishu', chatId: 'chat-bind', userId: 'user-a' },
+      text: '/bind 123e4567-e89b-12d3-a456-426614174000',
+      timestamp: Date.now(),
+      isGroup: true,
+      triggerReason: 'mention',
+    });
+
+    assert.equal(capturedAbortController?.signal.aborted, false);
+    assert.ok(sent.some((msg) => msg.text.includes('Session not found for this Feishu chat.')));
+
+    streamController.enqueue(`data: ${JSON.stringify({ type: 'result', data: JSON.stringify({ is_error: false, session_id: 'sdk-current' }) })}\n`);
+    streamController.close();
+    await activeTask;
   });
 });
 

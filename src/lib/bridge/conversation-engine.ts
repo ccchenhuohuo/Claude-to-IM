@@ -350,7 +350,6 @@ async function consumeStream(
               const statusData = JSON.parse(event.data);
               if (statusData.session_id) {
                 capturedSdkSessionId = statusData.session_id;
-                store.updateSdkSessionId(sessionId, statusData.session_id);
               }
               if (statusData.model) {
                 store.updateSessionModel(sessionId, statusData.model);
@@ -384,7 +383,6 @@ async function consumeStream(
               }
               if (resultData.session_id) {
                 capturedSdkSessionId = resultData.session_id;
-                store.updateSdkSessionId(sessionId, resultData.session_id);
               }
             } catch { /* skip */ }
             break;

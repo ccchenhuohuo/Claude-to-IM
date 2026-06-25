@@ -1,15 +1,10 @@
 /**
- * Adapter catalog — side-effect imports that trigger self-registration
- * of all available channel adapters.
+ * Feishu-only adapter catalog — side-effect import that triggers
+ * self-registration of the single supported channel adapter.
  *
- * To add a new adapter:
- * 1. Create the adapter file (e.g. `discord-adapter.ts`) with self-registration
- * 2. Add a side-effect import line below
- *
- * bridge-manager.ts imports this module; it never needs to change for new adapters.
+ * The bridge used to load every bundled IM adapter from this catalog. The
+ * product surface is now intentionally Feishu/Lark-only, so bridge-manager.ts
+ * should discover only the Feishu adapter at runtime.
  */
 
-import './telegram-adapter.js';
 import './feishu-adapter.js';
-import './discord-adapter.js';
-import './qq-adapter.js';
